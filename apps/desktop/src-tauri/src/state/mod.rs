@@ -5,21 +5,22 @@
 //!
 //! # Field ownership rules (Architecture §4, Invariants §8)
 //!
-//! | Field                | Owner    | Description                                   |
-//! |----------------------|----------|-----------------------------------------------|
-//! | `db`                 | Phase 3A | Live database pool                            |
-//! | `settings`           | Phase 3A | Eagerly-loaded settings cache                 |
-//! | `active_session_id`  | Phase 3E | ID of the currently open Hydration Session    |
-//! | `scheduler_paused`   | Phase 3E | Active Usage SM — scheduler paused flag       |
-//! | `remaining_ms`       | Phase 3E | Timer preservation across pause/resume        |
-//! | `active_ms_today`    | Phase 3E | Usage time accumulation for the current day   |
-//! | `scheduler`          | Phase 4A | Internal reminder scheduler (SchedulerService)|
+//! | Field                | Owner    | Description                                        |
+//! |----------------------|----------|----------------------------------------------------|
+//! | `db`                 | Phase 3A | Live database pool                                 |
+//! | `settings`           | Phase 3A | Eagerly-loaded settings cache                      |
+//! | `active_session_id`  | Phase 3E | ID of the currently open Hydration Session         |
+//! | `scheduler_paused`   | Phase 3E | Active Usage SM — scheduler paused flag            |
+//! | `remaining_ms`       | Phase 3E | Timer preservation across pause/resume             |
+//! | `active_ms_today`    | Phase 3E | Usage time accumulation for the current day        |
+//! | `scheduler`          | Phase 4A | Internal reminder scheduler (SchedulerService)     |
+//! | `activity_monitor`   | Phase 4B | Active Usage Monitor (ActivityMonitorService)      |
 
 use sqlx::{Pool, Sqlite};
 use std::sync::Mutex;
 
 use crate::models::AppSettings;
-use crate::services::SchedulerService;
+use crate::services::{ActivityMonitorService, SchedulerService};
 
 /// Tauri-managed shared state for the AquaTick backend.
 ///
@@ -97,21 +98,36 @@ pub struct AppState {
     /// `SchedulerService` ensures only one timer task exists at any time by
     /// cancelling the previous `AbortHandle` before spawning a new one.
     pub scheduler: SchedulerService,
+
+    // ── Activity Monitor (Phase 4B) ───────────────────────────────────────────
+
+    /// Active Usage Monitor.
+    ///
+    /// Detects user idle, system sleep/wake, and screen lock events.
+    /// Calls `SchedulerService::pause()` / `SchedulerService::resume()` in response.
+    ///
+    /// # Invariant AM-1
+    /// Only one poll task may exist at any time. `ActivityMonitorService::start()`
+    /// is a no-op if the monitor is already running.
+    pub activity_monitor: ActivityMonitorService,
 }
 
 impl AppState {
     /// Creates a new `AppState` with the given database pool and initial settings.
     ///
-    /// The scheduler starts in the `Stopped` state. No timer is running.
+    /// Both the scheduler and the activity monitor start in their respective
+    /// idle states (`Stopped` and `Active`). No background tasks are running
+    /// until explicitly started.
     pub fn new(db: Pool<Sqlite>, settings: AppSettings) -> Self {
         Self {
             db,
-            settings: Mutex::new(settings),
+            settings:          Mutex::new(settings),
             active_session_id: Mutex::new(None),
-            scheduler_paused: Mutex::new(false),
-            remaining_ms: Mutex::new(None),
-            active_ms_today: Mutex::new(0),
-            scheduler: SchedulerService::new(),
+            scheduler_paused:  Mutex::new(false),
+            remaining_ms:      Mutex::new(None),
+            active_ms_today:   Mutex::new(0),
+            scheduler:         SchedulerService::new(),
+            activity_monitor:  ActivityMonitorService::new(),
         }
     }
 }

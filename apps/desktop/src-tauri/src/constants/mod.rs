@@ -70,6 +70,12 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// How often Rust polls the OS idle API (seconds).
 pub const IDLE_POLL_INTERVAL_SECONDS: u64 = 10;
 
+/// If the actual gap between two consecutive polls exceeds the poll interval
+/// multiplied by this factor, the system is assumed to have slept and woken.
+///
+/// Example: poll interval = 10 s, multiplier = 4 → gap > 40 s → sleep detected.
+pub const SLEEP_GAP_MULTIPLIER: u32 = 4;
+
 // ── Well-known Setting Keys ───────────────────────────────────────────────────
 
 /// String keys used to read/write rows in the `settings` table.

@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use sqlx::{Pool, Sqlite};
 use tokio::task::AbortHandle;
 
-use crate::services::SessionService;
+use crate::services::session_service::SessionService;
 
 // ── Scheduler state ───────────────────────────────────────────────────────────
 
@@ -110,16 +110,34 @@ struct InnerState {
     ///
     /// Invariant T-1: always cancelled before a new timer is spawned.
     timer_handle: Option<AbortHandle>,
+
+    // ── Session context (set on start, reused by resume / reset) ─────────────
+
+    /// Database pool — passed through to `SessionService::create_pending` on expiry.
+    pool: Option<Pool<Sqlite>>,
+
+    /// ID of the character to associate with the triggered session.
+    character_id: String,
+
+    /// ID of the sound to associate with the triggered session, if any.
+    sound_id: Option<String>,
+
+    /// Reminder interval expressed as minutes (stored in the session row).
+    interval_minutes: i64,
 }
 
 impl InnerState {
     fn new() -> Self {
         Self {
-            state:        SchedulerState::Stopped,
-            interval:     Duration::ZERO,
-            remaining:    None,
-            started_at:   None,
-            timer_handle: None,
+            state:            SchedulerState::Stopped,
+            interval:         Duration::ZERO,
+            remaining:        None,
+            started_at:       None,
+            timer_handle:     None,
+            pool:             None,
+            character_id:     String::new(),
+            sound_id:         None,
+            interval_minutes: 0,
         }
     }
 
@@ -142,10 +160,10 @@ impl InnerState {
 ///
 /// ```rust,ignore
 /// let scheduler = SchedulerService::new();
-/// scheduler.start(pool.clone(), interval, settings).await;
+/// scheduler.start(pool, interval, character_id, sound_id, interval_minutes).await;
 /// // … later …
 /// scheduler.pause().await;
-/// scheduler.resume().await;
+/// scheduler.resume().await;  // uses stored session context — no extra params
 /// scheduler.stop().await;
 /// ```
 #[derive(Clone)]
@@ -200,12 +218,15 @@ impl SchedulerService {
 
     // ── State transitions ─────────────────────────────────────────────────────
 
-    /// Starts the scheduler with the given interval.
+    /// Starts the scheduler with the given interval and session context.
     ///
     /// Valid from: `Stopped`, `Triggered`.
     /// Invalid from: `Running`, `Paused` (logged and ignored).
     ///
     /// Cancels any existing timer before spawning a fresh one.
+    /// Stores `pool`, `character_id`, `sound_id`, and `interval_minutes` in
+    /// `InnerState` so that `resume()` and `reset()` can reuse them without
+    /// requiring the caller to pass them again.
     pub async fn start(
         &self,
         pool: Pool<Sqlite>,
@@ -236,9 +257,15 @@ impl SchedulerService {
         // Cancel any lingering timer from the previous cycle.
         guard.cancel_timer();
 
-        guard.interval  = interval;
-        guard.remaining = None;
-        guard.state     = SchedulerState::Running;
+        // Store session context for later resume / reset calls.
+        guard.pool             = Some(pool.clone());
+        guard.character_id     = character_id.clone();
+        guard.sound_id         = sound_id.clone();
+        guard.interval_minutes = interval_minutes;
+
+        guard.interval   = interval;
+        guard.remaining  = None;
+        guard.state      = SchedulerState::Running;
         guard.started_at = Some(Instant::now());
 
         let handle = self.spawn_timer(
@@ -253,7 +280,11 @@ impl SchedulerService {
         log::info!("Scheduler: Started with interval {:?}.", interval);
     }
 
-    /// Stops the scheduler unconditionally and resets all state.
+    /// Stops the scheduler unconditionally and resets all timing state.
+    ///
+    /// Session context (`pool`, `character_id`, etc.) is **preserved** so that
+    /// a subsequent `start()` call can still reference the same configuration.
+    /// Only timing fields are cleared.
     ///
     /// Valid from any state.
     pub async fn stop(&self) {
@@ -269,6 +300,7 @@ impl SchedulerService {
         guard.state      = SchedulerState::Stopped;
         guard.remaining  = None;
         guard.started_at = None;
+        // Pool and session context are intentionally retained for future start() calls.
 
         log::info!("Scheduler: Stopped.");
     }
@@ -295,8 +327,8 @@ impl SchedulerService {
         }
 
         // Capture remaining time before cancelling the task.
-        let elapsed = guard.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-        let base    = guard.remaining.unwrap_or(guard.interval);
+        let elapsed   = guard.started_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        let base      = guard.remaining.unwrap_or(guard.interval);
         let remaining = base.saturating_sub(elapsed);
 
         guard.cancel_timer();
@@ -309,62 +341,78 @@ impl SchedulerService {
 
     /// Resumes the scheduler from the captured remaining time.
     ///
+    /// Uses the session context stored at the last `start()` call — callers do
+    /// not need to supply `pool`, `character_id`, or `sound_id` again.
+    ///
     /// Valid from: `Paused`.
     /// Invalid from: `Stopped`, `Running`, `Triggered` (logged and ignored).
-    pub async fn resume(
-        &self,
-        pool: Pool<Sqlite>,
-        character_id: String,
-        sound_id: Option<String>,
-        interval_minutes: i64,
-    ) {
-        let mut guard = match self.inner.lock() {
-            Ok(g)  => g,
-            Err(e) => {
-                log::error!("Scheduler: failed to acquire lock in resume(): {}", e);
+    pub async fn resume(&self) {
+        let (pool, character_id, sound_id, interval_minutes, remaining) = {
+            let mut guard = match self.inner.lock() {
+                Ok(g)  => g,
+                Err(e) => {
+                    log::error!("Scheduler: failed to acquire lock in resume(): {}", e);
+                    return;
+                }
+            };
+
+            if guard.state != SchedulerState::Paused {
+                log::warn!(
+                    "Scheduler: resume() called while in state '{}' — ignoring.",
+                    guard.state
+                );
                 return;
             }
-        };
 
-        if guard.state != SchedulerState::Paused {
-            log::warn!(
-                "Scheduler: resume() called while in state '{}' — ignoring.",
-                guard.state
+            let pool = match guard.pool.clone() {
+                Some(p) => p,
+                None => {
+                    log::error!("Scheduler: resume() — no pool stored; was start() ever called?");
+                    return;
+                }
+            };
+
+            let remaining        = guard.remaining.unwrap_or(guard.interval);
+            let character_id     = guard.character_id.clone();
+            let sound_id         = guard.sound_id.clone();
+            let interval_minutes = guard.interval_minutes;
+
+            guard.state      = SchedulerState::Running;
+            guard.started_at = Some(Instant::now());
+
+            let handle = self.spawn_timer(
+                pool.clone(),
+                remaining,
+                character_id.clone(),
+                sound_id.clone(),
+                interval_minutes,
             );
-            return;
-        }
+            guard.timer_handle = Some(handle);
 
-        let remaining = guard.remaining.unwrap_or(guard.interval);
-        guard.state      = SchedulerState::Running;
-        guard.started_at = Some(Instant::now());
-
-        let handle = self.spawn_timer(
-            pool,
-            remaining,
-            character_id,
-            sound_id,
-            interval_minutes,
-        );
-        guard.timer_handle = Some(handle);
+            remaining
+        };
 
         log::info!("Scheduler: Resumed. Firing in {:?}.", remaining);
     }
 
     /// Resets the scheduler: stops any running timer and restarts from the full interval.
     ///
+    /// Uses the session context stored at the last `start()` call — callers do
+    /// not need to supply any extra parameters.
+    ///
     /// Valid from: `Running`, `Paused`, `Triggered`.
-    /// No-op from `Stopped`.
-    pub async fn reset(
-        &self,
-        pool: Pool<Sqlite>,
-        character_id: String,
-        sound_id: Option<String>,
-        interval_minutes: i64,
-    ) {
-        // Capture current interval before stopping (stop() clears state).
-        let interval = {
+    /// No-op from `Stopped` (nothing to reset).
+    pub async fn reset(&self) {
+        // Capture the stored context before stop() clears the state.
+        let (pool, interval, character_id, sound_id, interval_minutes) = {
             match self.inner.lock() {
-                Ok(g)  => g.interval,
+                Ok(g) => (
+                    g.pool.clone(),
+                    g.interval,
+                    g.character_id.clone(),
+                    g.sound_id.clone(),
+                    g.interval_minutes,
+                ),
                 Err(e) => {
                     log::error!("Scheduler: failed to acquire lock in reset(): {}", e);
                     return;
@@ -372,16 +420,25 @@ impl SchedulerService {
             }
         };
 
-        // Full stop.
+        if interval == Duration::ZERO {
+            log::warn!("Scheduler: reset() called with zero interval — staying Stopped.");
+            return;
+        }
+
+        let pool = match pool {
+            Some(p) => p,
+            None => {
+                log::warn!("Scheduler: reset() — no pool stored; was start() ever called?");
+                return;
+            }
+        };
+
+        // Full stop (retains session context).
         self.stop().await;
 
-        // Re-start only if we had a meaningful interval configured.
-        if interval > Duration::ZERO {
-            self.start(pool, interval, character_id, sound_id, interval_minutes).await;
-            log::info!("Scheduler: Reset — restarted from full interval {:?}.", interval);
-        } else {
-            log::warn!("Scheduler: reset() called with zero interval — staying Stopped.");
-        }
+        // Re-start from the full interval with the same session context.
+        self.start(pool, interval, character_id, sound_id, interval_minutes).await;
+        log::info!("Scheduler: Reset — restarted from full interval {:?}.", interval);
     }
 
     // ── Private timer ─────────────────────────────────────────────────────────
@@ -409,7 +466,26 @@ impl SchedulerService {
         let task = tokio::spawn(async move {
             tokio::time::sleep(duration).await;
 
-            // At this point the task has NOT been aborted — the duration elapsed.
+            // Re-acquire the scheduler state to verify we are still Running.
+            // If pause() or stop() was called just as the timer fired, we discard the trigger.
+            {
+                let guard = match inner.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        log::error!("Scheduler: failed to acquire lock on timer expiry: {}", e);
+                        return;
+                    }
+                };
+                if guard.state != SchedulerState::Running {
+                    log::info!(
+                        "Scheduler: Timer fired but state is '{}'. Discarding trigger.",
+                        guard.state
+                    );
+                    return;
+                }
+            }
+
+            // At this point the task has NOT been aborted and state is Running.
             // Create the pending session.
             let now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -450,7 +526,6 @@ impl SchedulerService {
                         e
                     );
                     // Do not transition to Triggered — the session wasn't created.
-                    // Leave state as Running so the caller can decide what to do.
                 }
             }
         });

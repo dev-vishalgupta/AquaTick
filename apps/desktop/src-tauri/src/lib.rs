@@ -67,10 +67,21 @@ pub fn run() {
                             .await
                             .unwrap_or_else(|_| models::DailyStatistic::zero(&today_str, now_ms));
 
-                        // 4. Initialize and manage shared AppState
-                        app_handle.manage(state::AppState::new(pool, settings.clone()));
+                        // 4. Initialize and manage shared AppState.
+                        //    We clone the service handles BEFORE manage() so we can
+                        //    start the monitor after Tauri takes ownership of the state.
+                        let app_state      = state::AppState::new(pool, settings.clone());
+                        let scheduler_h    = app_state.scheduler.clone();
+                        let monitor_h      = app_state.activity_monitor.clone();
 
-                        // 5. Emit app ready event to notify React frontend with initial payload
+                        app_handle.manage(app_state);
+
+                        // 5. Start the Active Usage Monitor.
+                        //    It will pause / resume `scheduler_h` based on idle and sleep events.
+                        monitor_h.start(scheduler_h).await;
+                        log::info!("ActivityMonitor: Running.");
+
+                        // 6. Emit app ready event to notify React frontend with initial payload.
                         let payload = AppReadyPayload {
                             settings,
                             today_stats,

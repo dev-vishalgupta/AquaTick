@@ -35,3 +35,10 @@ chrono  = { version = "0.4", features = ["serde"] }
 
 # Structured logging
 log     = "0.4"
+
+# Platform-specific idle time detection (Windows only — other platforms gracefully skip)
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_SystemInformation",
+] }
