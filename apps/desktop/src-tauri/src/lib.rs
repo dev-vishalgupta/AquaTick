@@ -15,7 +15,6 @@ mod database;
 mod errors;
 mod models;
 mod repositories;
-mod scheduler;
 mod services;
 mod state;
 
@@ -95,9 +94,6 @@ pub fn run() {
             commands::statistics::get_daily_statistics,
             commands::statistics::get_weekly_statistics,
             commands::session::get_session_by_id,
-            commands::scheduler::start_scheduler,
-            commands::scheduler::stop_scheduler,
-            commands::scheduler::get_scheduler_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -5,39 +5,32 @@
 //!
 //! # Field ownership rules (Architecture §4, Invariants §8)
 //!
-//! | Field                | Phase   | Purpose                         |
-//! |----------------------|---------|---------------------------------|
-//! | `db`                 | Phase 3A | Live database pool              |
-//! | `settings`           | Phase 3A | Eagerly-loaded settings cache   |
-//! | `active_session_id`  | Phase 3E | Session lifecycle               |
-//! | `scheduler_paused`   | Phase 3E | Active Usage SM                 |
-//! | `remaining_ms`       | Phase 3E | Timer preservation              |
-//! | `active_ms_today`    | Phase 3E | Usage time tracking             |
-//! | `reminder_timer`     | Phase 4A | Reminder Engine SM              |
-//! | `snooze_timer`       | Phase 4  | Reminder Engine SM (future)     |
-//! | `timeout_timer`      | Phase 4  | Reminder Engine SM (future)     |
+//! | Field                | Owner    | Description                                   |
+//! |----------------------|----------|-----------------------------------------------|
+//! | `db`                 | Phase 3A | Live database pool                            |
+//! | `settings`           | Phase 3A | Eagerly-loaded settings cache                 |
+//! | `active_session_id`  | Phase 3E | ID of the currently open Hydration Session    |
+//! | `scheduler_paused`   | Phase 3E | Active Usage SM — scheduler paused flag       |
+//! | `remaining_ms`       | Phase 3E | Timer preservation across pause/resume        |
+//! | `active_ms_today`    | Phase 3E | Usage time accumulation for the current day   |
+//! | `scheduler`          | Phase 4A | Internal reminder scheduler (SchedulerService)|
 
 use sqlx::{Pool, Sqlite};
 use std::sync::Mutex;
-use tokio::task::AbortHandle;
 
 use crate::models::AppSettings;
+use crate::services::SchedulerService;
 
 /// Tauri-managed shared state for the AquaTick backend.
 ///
 /// All mutable fields are wrapped in `Mutex` so they can be safely accessed
 /// from concurrent Tauri command handlers.
-///
-/// # Invariant T-1 / T-2 / T-3 (State Machine §8)
-/// Only one reminder timer, one snooze timer, and one timeout timer may exist
-/// at any time. These invariants are enforced by the Scheduler/Reminder Engine
-/// by cancelling the previous handle before creating a new one.
 pub struct AppState {
     // ── Database ──────────────────────────────────────────────────────────────
 
     /// SQLite connection pool — the only database access point in the backend.
     ///
-    /// `Pool<Sqlite>` is internally `Arc`-wrapped and `Clone`-able.
+    /// `Pool<Sqlite>` is internally `Arc`-wrapped and clone-able.
     /// Repositories and services receive a reference to this pool.
     pub db: Pool<Sqlite>,
 
@@ -55,14 +48,15 @@ pub struct AppState {
     /// ID of the currently open Hydration Session.
     ///
     /// `None` when no session is active.
-    /// Set to `Some(id)` when the reminder timer fires.
+    /// Set to `Some(id)` when the scheduler transitions to `Triggered`.
     /// Cleared to `None` when a session reaches `completed` or `timed_out`.
     ///
     /// # Invariant S-1 / S-6
-    /// Only one active session may exist at any time.
+    /// Only one active session may exist at any time. A snoozed session is
+    /// still considered active (`Some(id)` is preserved during snooze).
     pub active_session_id: Mutex<Option<i64>>,
 
-    // ── Scheduler state ───────────────────────────────────────────────────────
+    // ── Active Usage tracking ─────────────────────────────────────────────────
 
     /// Whether reminder scheduling is currently paused.
     ///
@@ -84,43 +78,31 @@ pub struct AppState {
 
     /// Cumulative active milliseconds recorded during the current calendar day.
     ///
+    /// Used to compute `daily_statistics.expected_sessions`:
+    ///   `expected = active_ms_today / (interval_minutes * 60 * 1000)`
+    ///
     /// Resets at midnight. Written to `daily_statistics` when a session resolves.
     ///
     /// # Invariant SC-3 / SC-4
     pub active_ms_today: Mutex<u64>,
 
-    // ── Timer handles (Phase 4A+) ─────────────────────────────────────────────
+    // ── Scheduler (Phase 4A) ──────────────────────────────────────────────────
 
-    /// Active reminder timer abort handle.
+    /// Internal reminder scheduler.
     ///
-    /// `Some(handle)` while the countdown is running or paused.
-    /// `None` when the scheduler is stopped.
-    /// Replaced (aborted then re-created) on every restart.
+    /// Owns the single timer task (`AbortHandle`) and the scheduler state machine.
+    /// All timing and session-creation on expiry is encapsulated inside this struct.
     ///
     /// # Invariant T-1
-    pub reminder_timer: Mutex<Option<AbortHandle>>,
-
-    /// Active snooze timer abort handle.
-    ///
-    /// Populated when the user snoozes a triggered session.
-    /// `None` at all other times.
-    ///
-    /// # Invariant T-2 / T-3
-    pub snooze_timer: Mutex<Option<AbortHandle>>,
-
-    /// Active session-timeout timer abort handle.
-    ///
-    /// Populated when a triggered session starts its auto-timeout countdown.
-    /// `None` at all other times.
-    ///
-    /// # Invariant T-4
-    pub timeout_timer: Mutex<Option<AbortHandle>>,
+    /// `SchedulerService` ensures only one timer task exists at any time by
+    /// cancelling the previous `AbortHandle` before spawning a new one.
+    pub scheduler: SchedulerService,
 }
 
 impl AppState {
     /// Creates a new `AppState` with the given database pool and initial settings.
     ///
-    /// All timer and scheduler fields start in their "inactive" state.
+    /// The scheduler starts in the `Stopped` state. No timer is running.
     pub fn new(db: Pool<Sqlite>, settings: AppSettings) -> Self {
         Self {
             db,
@@ -129,9 +111,7 @@ impl AppState {
             scheduler_paused: Mutex::new(false),
             remaining_ms: Mutex::new(None),
             active_ms_today: Mutex::new(0),
-            reminder_timer: Mutex::new(None),
-            snooze_timer: Mutex::new(None),
-            timeout_timer: Mutex::new(None),
+            scheduler: SchedulerService::new(),
         }
     }
 }
