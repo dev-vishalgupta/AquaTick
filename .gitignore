@@ -1,0 +1,40 @@
+# Dependency directories
+node_modules/
+
+# Build outputs
+dist/
+dist-ssr/
+build/
+
+# Tauri/Rust outputs
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# Logs
+*.log
+logs/
+
+# SQLite Databases
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE and Editor configs
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.tmp

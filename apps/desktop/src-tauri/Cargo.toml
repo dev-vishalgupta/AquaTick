@@ -1,0 +1,37 @@
+[package]
+name = "aquatick"
+version = "0.1.0"
+description = "AquaTick Desktop Application"
+authors = ["Vishal Gupta"]
+edition = "2021"
+
+[lib]
+name = "aquatick_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+tauri          = { version = "2.1.0", features = [] }
+serde          = { version = "1.0",   features = ["derive"] }
+serde_json     = "1.0"
+
+# Tauri plugins
+tauri-plugin-sql          = { version = "2.1.0", features = ["sqlite"] }
+tauri-plugin-window-state = { version = "2.1.0" }
+
+# Database — direct SQLite access from Rust (backend repositories + services)
+sqlx    = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+
+# Async runtime — required by sqlx and the Tauri async setup hook
+tokio   = { version = "1", features = ["full"] }
+
+# Error handling
+thiserror = "1"
+
+# Timestamps (Unix ms) — used throughout database layer
+chrono  = { version = "0.4", features = ["serde"] }
+
+# Structured logging
+log     = "0.4"

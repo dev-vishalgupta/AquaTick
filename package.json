@@ -1,0 +1,11 @@
+{
+  "name": "aquatick-monorepo",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter desktop dev",
+    "build": "pnpm --filter desktop build",
+    "lint": "pnpm --filter desktop lint",
+    "format": "pnpm --filter desktop format",
+    "typecheck": "pnpm --filter desktop typecheck"
+  }
+}
