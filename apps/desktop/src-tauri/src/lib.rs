@@ -18,11 +18,12 @@ mod repositories;
 mod services;
 mod state;
 
+use std::time::Duration;
 use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct AppReadyPayload {
-    settings: models::AppSettings,
+    settings:    models::AppSettings,
     today_stats: models::DailyStatistic,
 }
 
@@ -32,66 +33,74 @@ pub fn run() {
         .plugin(tauri_plugin_sql::Builder::default().build())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
-            // Resolve the platform-specific app data directory before spawning.
-            // On Windows: %APPDATA%\com.aquatick.app
             let app_data_dir = app.path().app_data_dir()?;
-            let app_handle = app.handle().clone();
+            let app_handle   = app.handle().clone();
 
-            // Spawn the async initialization sequence.
             tauri::async_runtime::spawn(async move {
                 match database::init_db(&app_data_dir).await {
                     Ok(pool) => {
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-
-                        // 1. Recover stale sessions left in 'triggered' state across crash/shutdown
-                        let recovered = services::SessionService::recover_stale(
-                            &pool,
-                            now_ms,
-                            constants::DEFAULT_SESSION_TIMEOUT_MINUTES,
-                        )
-                        .await
-                        .unwrap_or(0);
-
-                        if recovered > 0 {
-                            log::info!("Recovered {} stale triggered session(s) on startup.", recovered);
-                        }
-
-                        // 2. Load all settings from database to construct AppState settings cache
+                        // 1. Load settings first (needed by engine callback).
                         let settings = services::SettingsService::load_all(&pool)
                             .await
                             .unwrap_or_default();
 
-                        // 3. Pre-fetch today's statistics
+                        // 2. Pre-fetch today's statistics.
+                        let now_ms    = chrono::Utc::now().timestamp_millis();
                         let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                        let today_stats = services::StatisticsService::get_daily_statistics(&pool, &today_str)
-                            .await
-                            .unwrap_or_else(|_| models::DailyStatistic::zero(&today_str, now_ms));
+                        let today_stats = services::StatisticsService::get_daily_statistics(
+                            &pool, &today_str,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            models::DailyStatistic::zero(&today_str, now_ms)
+                        });
 
-                        // 4. Initialize and manage shared AppState.
-                        //    We clone the service handles BEFORE manage() so we can
-                        //    start the monitor after Tauri takes ownership of the state.
-                        let app_state      = state::AppState::new(pool, settings.clone());
-                        let scheduler_h    = app_state.scheduler.clone();
-                        let monitor_h      = app_state.activity_monitor.clone();
+                        // 3. Initialize AppState and extract clones before manage().
+                        let app_state    = state::AppState::new(pool.clone(), settings.clone());
+                        let scheduler_h  = app_state.scheduler.clone();
+                        let monitor_h    = app_state.activity_monitor.clone();
+                        let engine_h     = app_state.reminder_engine.clone();
 
                         app_handle.manage(app_state);
 
-                        // 5. Start the Active Usage Monitor.
-                        //    It will pause / resume `scheduler_h` based on idle and sleep events.
+                        // 4. Recover stale sessions from a previous crash/shutdown.
+                        engine_h.recover_stale_sessions(&pool).await;
+
+                        // 5. Build the on_reminder_due callback that wires
+                        //    SchedulerService → ReminderEngineService.
+                        let callback = services::build_reminder_due_callback(
+                            engine_h.clone(),
+                            pool.clone(),
+                            settings.clone(),
+                            scheduler_h.clone(),
+                        );
+
+                        // 6. Start the reminder scheduler with the initial interval.
+                        let interval = Duration::from_secs(
+                            (settings.reminder_interval_minutes as u64).saturating_mul(60)
+                        );
+                        if settings.reminder_enabled {
+                            scheduler_h.start(interval, callback).await;
+                            log::info!(
+                                "Scheduler: Started (interval: {} min).",
+                                settings.reminder_interval_minutes
+                            );
+                        } else {
+                            log::info!("Scheduler: Reminders disabled — scheduler not started.");
+                        }
+
+                        // 7. Start the Active Usage Monitor.
+                        //    It pauses / resumes `scheduler_h` based on idle and sleep events.
                         monitor_h.start(scheduler_h).await;
                         log::info!("ActivityMonitor: Running.");
 
-                        // 6. Emit app ready event to notify React frontend with initial payload.
-                        let payload = AppReadyPayload {
-                            settings,
-                            today_stats,
-                        };
+                        // 8. Emit app/ready to notify the React frontend.
+                        let payload = AppReadyPayload { settings, today_stats };
                         app_handle.emit("aquatick://app/ready", payload).ok();
 
                         log::info!("AquaTick backend initialized successfully. Emitted app/ready.");
                     }
                     Err(e) => {
-                        // A database failure at startup is fatal.
                         log::error!("FATAL: Database initialization failed: {}", e);
                     }
                 }

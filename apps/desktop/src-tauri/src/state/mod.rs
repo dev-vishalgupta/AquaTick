@@ -15,12 +15,13 @@
 //! | `active_ms_today`    | Phase 3E | Usage time accumulation for the current day        |
 //! | `scheduler`          | Phase 4A | Internal reminder scheduler (SchedulerService)     |
 //! | `activity_monitor`   | Phase 4B | Active Usage Monitor (ActivityMonitorService)      |
+//! | `reminder_engine`    | Phase 4C | Reminder lifecycle orchestrator (ReminderEngine)   |
 
 use sqlx::{Pool, Sqlite};
 use std::sync::Mutex;
 
 use crate::models::AppSettings;
-use crate::services::{ActivityMonitorService, SchedulerService};
+use crate::services::{ActivityMonitorService, ReminderEngineService, SchedulerService};
 
 /// Tauri-managed shared state for the AquaTick backend.
 ///
@@ -110,6 +111,22 @@ pub struct AppState {
     /// Only one poll task may exist at any time. `ActivityMonitorService::start()`
     /// is a no-op if the monitor is already running.
     pub activity_monitor: ActivityMonitorService,
+
+    // ── Reminder Engine (Phase 4C) ────────────────────────────────────────────
+
+    /// Reminder lifecycle orchestrator.
+    ///
+    /// Owns the session creation, state transitions, timeout timer, and snooze
+    /// timer. The scheduler calls the engine via a stored callback when the
+    /// reminder interval expires.
+    ///
+    /// # Invariant RE-1
+    /// Only one active `HydrationSession` may exist at any time.
+    /// # Invariant RE-2
+    /// Only one timeout timer may exist at any time.
+    /// # Invariant RE-3
+    /// Only one snooze timer may exist at any time.
+    pub reminder_engine: ReminderEngineService,
 }
 
 impl AppState {
@@ -128,6 +145,7 @@ impl AppState {
             active_ms_today:   Mutex::new(0),
             scheduler:         SchedulerService::new(),
             activity_monitor:  ActivityMonitorService::new(),
+            reminder_engine:   ReminderEngineService::new(),
         }
     }
 }
