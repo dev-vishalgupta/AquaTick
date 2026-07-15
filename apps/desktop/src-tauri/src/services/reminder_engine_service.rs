@@ -1,4 +1,4 @@
-//! Reminder Engine — orchestrates the complete reminder lifecycle.
+//! Reminder Engine â€” orchestrates the complete reminder lifecycle.
 //!
 //! # Scope
 //!
@@ -19,10 +19,10 @@
 //!
 //! ```text
 //!   SchedulerService         (owns: countdown timer only)
-//!          ¦  on_reminder_due callback
+//!          Â¦  on_reminder_due callback
 //!          ?
 //!   ReminderEngineService    (owns: session lifecycle, timeout, snooze)
-//!          ¦  SessionService calls
+//!          Â¦  SessionService calls
 //!          ?
 //!   SessionRepository / DB
 //! ```
@@ -31,26 +31,26 @@
 //!
 //! ```text
 //!   +------+  handle_reminder_due  +---------------+
-//!   ¦ Idle ¦ -------------------? ¦ SessionActive ¦
+//!   Â¦ Idle Â¦ -------------------? Â¦ SessionActive Â¦
 //!   +------+                       +---------------+
-//!                                          ¦ complete_session()
-//!                                          ¦   ? Completed  ? Idle (scheduler reset)
-//!                                          ¦ timeout_session()
-//!                                          ¦   ? TimedOut   ? Idle (scheduler reset)
-//!                                          ¦ snooze_session()
-//!                                          ¦   ? Snoozed
+//!                                          Â¦ complete_session()
+//!                                          Â¦   ? Completed  ? Idle (scheduler reset)
+//!                                          Â¦ timeout_session()
+//!                                          Â¦   ? TimedOut   ? Idle (scheduler reset)
+//!                                          Â¦ snooze_session()
+//!                                          Â¦   ? Snoozed
 //!                                          ?
 //!                                    +---------+
-//!                                    ¦ Snoozed ¦
+//!                                    Â¦ Snoozed Â¦
 //!                                    +---------+
-//!                                         ¦ snooze timer fires ? SessionActive (re-triggered)
+//!                                         Â¦ snooze timer fires ? SessionActive (re-triggered)
 //! ```
 //!
 //! # Thread Safety
 //!
 //! All mutable state lives in `Arc<Mutex<InnerEngineState>>`. No `.unwrap()` or
 //! `panic!()` appears in this module. Lock failures are logged and treated as
-//! no-ops — the engine remains in its last known state.
+//! no-ops â€” the engine remains in its last known state.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -109,6 +109,9 @@ struct InnerEngineState {
     ///
     /// Invariant T-4: only one snooze timer may exist at any time.
     snooze_handle: Option<AbortHandle>,
+
+    /// Tauri AppHandle to emit events.
+    app_handle: Option<tauri::AppHandle>,
 }
 
 impl InnerEngineState {
@@ -118,6 +121,7 @@ impl InnerEngineState {
             active_session_id: None,
             timeout_handle:    None,
             snooze_handle:     None,
+            app_handle:        None,
         }
     }
 
@@ -138,9 +142,9 @@ impl InnerEngineState {
 
 // -- ReminderEngineService -----------------------------------------------------
 
-/// Reminder Engine — single orchestrator of the reminder lifecycle.
+/// Reminder Engine â€” single orchestrator of the reminder lifecycle.
 ///
-/// `ReminderEngineService` is `Clone` — it wraps all mutable state in an
+/// `ReminderEngineService` is `Clone` â€” it wraps all mutable state in an
 /// `Arc<Mutex<_>>` so multiple handles can coexist safely.
 #[derive(Clone)]
 pub struct ReminderEngineService {
@@ -152,6 +156,13 @@ impl ReminderEngineService {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(InnerEngineState::new())),
+        }
+    }
+
+    /// Sets the tauri AppHandle for emitting IPC events to the frontend.
+    pub fn set_app_handle(&self, app_handle: tauri::AppHandle) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.app_handle = Some(app_handle);
         }
     }
 
@@ -179,7 +190,7 @@ impl ReminderEngineService {
     /// timeout timer. If a session is already active, the notification is
     /// discarded (guards against concurrent triggers).
     ///
-    /// Called from within the `OnReminderDue` callback — must not block.
+    /// Called from within the `OnReminderDue` callback â€” must not block.
     pub fn handle_reminder_due(
         &self,
         pool: Pool<Sqlite>,
@@ -197,7 +208,7 @@ impl ReminderEngineService {
             };
             if guard.engine_state != EngineState::Idle {
                 log::warn!(
-                    "ReminderEngine: handle_reminder_due() called while in state '{}' — discarding.",
+                    "ReminderEngine: handle_reminder_due() called while in state '{}' â€” discarding.",
                     guard.engine_state
                 );
                 return;
@@ -238,6 +249,24 @@ impl ReminderEngineService {
         self.clear_session_state(EngineState::Idle);
 
         log::info!("ReminderEngine: Session {} completed.", active_id);
+
+        // Emit session:completed event to frontend
+        {
+            use tauri::Emitter;
+            if let Ok(guard) = self.inner.lock() {
+                if let Some(app) = &guard.app_handle {
+                    #[derive(serde::Serialize, Clone)]
+                    struct CompletedPayload {
+                        #[serde(rename = "sessionId")]
+                        session_id: String,
+                    }
+                    let payload = CompletedPayload {
+                        session_id: active_id.to_string(),
+                    };
+                    app.emit("session:completed", payload).ok();
+                }
+            }
+        }
 
         // Restart the scheduler for the next reminder cycle.
         scheduler.reset().await;
@@ -282,6 +311,27 @@ impl ReminderEngineService {
         }
 
         log::info!("ReminderEngine: Session {} snoozed.", active_id);
+
+        // Emit session:snoozed event to frontend
+        {
+            use tauri::Emitter;
+            if let Ok(guard) = self.inner.lock() {
+                if let Some(app) = &guard.app_handle {
+                    #[derive(serde::Serialize, Clone)]
+                    struct SnoozedPayload {
+                        #[serde(rename = "sessionId")]
+                        session_id: String,
+                        #[serde(rename = "durationMin")]
+                        duration_min: i64,
+                    }
+                    let payload = SnoozedPayload {
+                        session_id: active_id.to_string(),
+                        duration_min: delay_minutes,
+                    };
+                    app.emit("session:snoozed", payload).ok();
+                }
+            }
+        }
 
         // Spawn the snooze timer.
         let snooze_handle = self.spawn_snooze_timer(
@@ -330,14 +380,14 @@ impl ReminderEngineService {
             Some(id) if id == session_id => id,
             Some(other) => {
                 log::warn!(
-                    "ReminderEngine: timeout_session() called for ID {} but active is {:?} — ignoring.",
+                    "ReminderEngine: timeout_session() called for ID {} but active is {:?} â€” ignoring.",
                     session_id, other
                 );
                 return Ok(());
             }
             None => {
                 log::warn!(
-                    "ReminderEngine: timeout_session() called but no active session — ignoring."
+                    "ReminderEngine: timeout_session() called but no active session â€” ignoring."
                 );
                 return Ok(());
             }
@@ -356,6 +406,24 @@ impl ReminderEngineService {
         self.clear_session_state(EngineState::Idle);
 
         log::info!("ReminderEngine: Session {} transitioned to timed_out.", active_id);
+
+        // Emit session:timedOut event to frontend
+        {
+            use tauri::Emitter;
+            if let Ok(guard) = self.inner.lock() {
+                if let Some(app) = &guard.app_handle {
+                    #[derive(serde::Serialize, Clone)]
+                    struct TimedOutPayload {
+                        #[serde(rename = "sessionId")]
+                        session_id: String,
+                    }
+                    let payload = TimedOutPayload {
+                        session_id: active_id.to_string(),
+                    };
+                    app.emit("session:timedOut", payload).ok();
+                }
+            }
+        }
 
         // Restart the scheduler.
         scheduler.reset().await;
@@ -441,6 +509,27 @@ impl ReminderEngineService {
         log::info!("ReminderEngine: Session {} triggered.", session.id);
 
         let session_id = session.id;
+
+        // Emit session:triggered event to frontend
+        {
+            use tauri::Emitter;
+            if let Ok(guard) = self.inner.lock() {
+                if let Some(app) = &guard.app_handle {
+                    #[derive(serde::Serialize, Clone)]
+                    struct TriggeredPayload {
+                        #[serde(rename = "sessionId")]
+                        session_id: String,
+                        #[serde(rename = "dueAt")]
+                        due_at: String,
+                    }
+                    let payload = TriggeredPayload {
+                        session_id: session_id.to_string(),
+                        due_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    app.emit("session:triggered", payload).ok();
+                }
+            }
+        }
 
         // Store active session and transition engine state.
         {
@@ -542,7 +631,7 @@ impl ReminderEngineService {
 
             if guard.engine_state != EngineState::Snoozed {
                 log::warn!(
-                    "ReminderEngine: snooze expired but engine state is '{}' — ignoring.",
+                    "ReminderEngine: snooze expired but engine state is '{}' â€” ignoring.",
                     guard.engine_state
                 );
                 return Ok(());
@@ -550,7 +639,7 @@ impl ReminderEngineService {
 
             if guard.active_session_id != Some(session_id) {
                 log::warn!(
-                    "ReminderEngine: snooze expired for session {} but active is {:?} — ignoring.",
+                    "ReminderEngine: snooze expired for session {} but active is {:?} â€” ignoring.",
                     session_id, guard.active_session_id
                 );
                 return Ok(());
@@ -560,6 +649,27 @@ impl ReminderEngineService {
         // Transition snoozed ? triggered in the DB.
         SessionService::mark_triggered(pool, session_id).await?;
         log::info!("ReminderEngine: Session {} re-triggered after snooze.", session_id);
+
+        // Emit session:triggered event to frontend
+        {
+            use tauri::Emitter;
+            if let Ok(guard) = self.inner.lock() {
+                if let Some(app) = &guard.app_handle {
+                    #[derive(serde::Serialize, Clone)]
+                    struct TriggeredPayload {
+                        #[serde(rename = "sessionId")]
+                        session_id: String,
+                        #[serde(rename = "dueAt")]
+                        due_at: String,
+                    }
+                    let payload = TriggeredPayload {
+                        session_id: session_id.to_string(),
+                        due_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    app.emit("session:triggered", payload).ok();
+                }
+            }
+        }
 
         // Transition engine state back to SessionActive.
         {
@@ -607,7 +717,7 @@ impl ReminderEngineService {
 
         if guard.engine_state != EngineState::SessionActive {
             return Err(crate::errors::AppError::Validation(format!(
-                "ReminderEngine: {}() called while in state '{}' — expected SessionActive.",
+                "ReminderEngine: {}() called while in state '{}' â€” expected SessionActive.",
                 caller, guard.engine_state
             )));
         }
@@ -619,7 +729,7 @@ impl ReminderEngineService {
                 caller, session_id, other
             ))),
             None => Err(crate::errors::AppError::Internal(format!(
-                "ReminderEngine: {}() — no active session ID despite SessionActive state.",
+                "ReminderEngine: {}() â€” no active session ID despite SessionActive state.",
                 caller
             ))),
         }

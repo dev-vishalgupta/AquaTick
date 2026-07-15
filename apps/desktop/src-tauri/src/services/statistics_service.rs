@@ -158,7 +158,7 @@ impl StatisticsService {
         let existing = StatisticsRepository::get_by_date(pool, date).await?;
 
         let stats = DailyStatistic {
-            id: existing.map(|e| e.id).unwrap_or(0),
+            id: existing.as_ref().map(|e| e.id).unwrap_or(0),
             date: date.to_string(),
             total_sessions,
             completed_count,
@@ -168,7 +168,7 @@ impl StatisticsService {
             expected_sessions,
             goal_met,
             streak_day,
-            created_at: existing.map(|e| e.created_at).unwrap_or(now_ms),
+            created_at: existing.as_ref().map(|e| e.created_at).unwrap_or(now_ms),
             updated_at: now_ms,
         };
 

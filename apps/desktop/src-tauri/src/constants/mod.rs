@@ -33,7 +33,7 @@ pub const DEFAULT_SOUND_ENABLED: bool = true;
 // ── Character ─────────────────────────────────────────────────────────────────
 
 /// Default character manifest ID.
-pub const DEFAULT_CHARACTER_ID: &str = "female_default";
+pub const DEFAULT_CHARACTER_ID: &str = "female";
 
 // ── Window ────────────────────────────────────────────────────────────────────
 
@@ -63,7 +63,7 @@ pub const APP_VERSION: &str = "0.1.0";
 // ── Database ──────────────────────────────────────────────────────────────────
 
 /// Current schema version. Increment when adding a new migration.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 // ── Active Usage ──────────────────────────────────────────────────────────────
 

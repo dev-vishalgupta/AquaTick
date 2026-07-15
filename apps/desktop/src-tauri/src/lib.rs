@@ -60,7 +60,7 @@ pub fn run() {
                         let scheduler_h  = app_state.scheduler.clone();
                         let monitor_h    = app_state.activity_monitor.clone();
                         let engine_h     = app_state.reminder_engine.clone();
-
+                        app_state.reminder_engine.set_app_handle(app_handle.clone());
                         app_handle.manage(app_state);
 
                         // 4. Recover stale sessions from a previous crash/shutdown.
@@ -114,6 +114,9 @@ pub fn run() {
             commands::statistics::get_daily_statistics,
             commands::statistics::get_weekly_statistics,
             commands::session::get_session_by_id,
+            commands::session::complete_session,
+            commands::session::snooze_session,
+            commands::session::timeout_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

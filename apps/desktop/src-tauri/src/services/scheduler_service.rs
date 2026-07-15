@@ -15,23 +15,23 @@
 //! `ReminderEngineService` when the interval expires via the `on_reminder_due`
 //! callback. Session creation is entirely owned by the Reminder Engine.
 //!
-//! # Scheduler State Machine (State Machine §2, simplified)
+//! # Scheduler State Machine (State Machine 2, simplified)
 //!
 //! ```text
 //!   +---------+  start(interval)  +---------+
-//!   ¦ Stopped ¦ ----------------? ¦ Running ¦
+//!   | Stopped | ----------------> | Running |
 //!   +---------+                   +---------+
-//!       ?                              ¦ pause()
-//!       ¦ stop()                  +----?----+
-//!       ¦                         ¦ Paused  ¦
-//!       ¦                         +---------+
-//!       ¦                              ¦ resume()
-//!       ¦                         +----?----+
-//!       ¦         stop()          ¦ Running ¦ (resumes from remaining)
-//!       ¦    ?------------------- +---------+
-//!       ¦                              ¦ timer expires
-//!       ¦                         +----?------+
-//!       +-------- stop() ------- ¦ Triggered ¦
+//!       |                              | pause()
+//!       | stop()                  +----v----+
+//!       |                         | Paused  |
+//!       |                         +---------+
+//!       |                              | resume()
+//!       |                         +----v----+
+//!       |         stop()          | Running | (resumes from remaining)
+//!       |    <------------------- +---------+
+//!       |                              | timer expires
+//!       |                         +----v------+
+//!       +-------- stop() ------- | Triggered |
 //!                                 +-----------+
 //! ```
 //!
@@ -121,7 +121,7 @@ impl InnerState {
 
 // -- SchedulerService ----------------------------------------------------------
 
-/// Internal reminder scheduler — owns only the countdown timer.
+/// Internal reminder scheduler - owns only the countdown timer.
 #[derive(Clone)]
 pub struct SchedulerService {
     inner: Arc<Mutex<InnerState>>,
@@ -169,7 +169,7 @@ impl SchedulerService {
 
         match guard.state {
             SchedulerState::Running | SchedulerState::Paused => {
-                log::warn!("Scheduler: start() in state '{}' — ignoring.", guard.state);
+                log::warn!("Scheduler: start() in state '{}' - ignoring.", guard.state);
                 return;
             }
             _ => {}
@@ -210,7 +210,7 @@ impl SchedulerService {
         };
 
         if guard.state != SchedulerState::Running {
-            log::warn!("Scheduler: pause() in state '{}' — ignoring.", guard.state);
+            log::warn!("Scheduler: pause() in state '{}' - ignoring.", guard.state);
             return;
         }
 
@@ -236,14 +236,14 @@ impl SchedulerService {
             };
 
             if guard.state != SchedulerState::Paused {
-                log::warn!("Scheduler: resume() in state '{}' — ignoring.", guard.state);
+                log::warn!("Scheduler: resume() in state '{}' - ignoring.", guard.state);
                 return;
             }
 
             let callback = match guard.on_reminder_due.clone() {
                 Some(cb) => cb,
                 None => {
-                    log::error!("Scheduler: resume() — no callback; was start() called?");
+                    log::error!("Scheduler: resume() - no callback; was start() called?");
                     return;
                 }
             };
@@ -272,17 +272,17 @@ impl SchedulerService {
         };
 
         if interval == Duration::ZERO {
-            log::warn!("Scheduler: reset() with zero interval — staying Stopped.");
+            log::warn!("Scheduler: reset() with zero interval - staying Stopped.");
             return;
         }
         let callback = match callback {
             Some(cb) => cb,
-            None => { log::warn!("Scheduler: reset() — no callback stored."); return; }
+            None => { log::warn!("Scheduler: reset() - no callback stored."); return; }
         };
 
         self.stop().await;
         self.start(interval, callback).await;
-        log::info!("Scheduler: Reset — restarted from full interval {:?}.", interval);
+        log::info!("Scheduler: Reset - restarted from full interval {:?}.", interval);
     }
 
     // -- Private ---------------------------------------------------------------
@@ -302,7 +302,7 @@ impl SchedulerService {
 
                 if guard.state != SchedulerState::Running {
                     log::info!(
-                        "Scheduler: Timer fired but state is '{}' — discarding (T-2).",
+                        "Scheduler: Timer fired but state is '{}' - discarding (T-2).",
                         guard.state
                     );
                     return;
@@ -315,7 +315,7 @@ impl SchedulerService {
                 guard.state        = SchedulerState::Triggered;
             }
 
-            log::info!("Scheduler: Reminder due — invoking on_reminder_due callback.");
+            log::info!("Scheduler: Reminder due - invoking on_reminder_due callback.");
             on_reminder_due();
         });
 

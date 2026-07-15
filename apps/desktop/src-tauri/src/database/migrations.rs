@@ -92,11 +92,23 @@ struct Migration {
     statements: &'static [&'static str],
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "Initial schema: settings, hydration_sessions, daily_statistics",
-    statements: MIGRATION_V1,
-}];
+const MIGRATION_V2: &[&str] = &[
+    "UPDATE settings SET value = 'female', updated_at = (strftime('%s','now')*1000) WHERE key = 'character.id' AND value = 'female_default'",
+    "UPDATE hydration_sessions SET character_id = 'female', updated_at = (strftime('%s','now')*1000) WHERE character_id = 'female_default'",
+];
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "Initial schema: settings, hydration_sessions, daily_statistics",
+        statements: MIGRATION_V1,
+    },
+    Migration {
+        version: 2,
+        description: "Migrate default character ID from female_default to female",
+        statements: MIGRATION_V2,
+    },
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
