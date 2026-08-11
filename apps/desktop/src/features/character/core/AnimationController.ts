@@ -98,8 +98,8 @@ export class AnimationController {
    */
   play(definition: AnimationDefinition, options?: PlayOptions): void {
     this.animDef = definition;
-    this.looping = options?.loop ?? definition.loop;
-    this.effectiveFps = options?.fps ?? definition.fps;
+    this.looping = options?.loop ?? definition.loop ?? true;
+    this.effectiveFps = options?.fps ?? definition.fps ?? 10;
     this.onFrameCallback = options?.onFrame;
     this.elapsedMs = 0;
     this.currentFrameIndex = 0;
@@ -109,7 +109,7 @@ export class AnimationController {
   /**
    * Advances the animation by `deltaMs` milliseconds.
    *
-   * Must be called on every iteration of the render loop while an animation
+   * Must be called on every iteration of the caller's render loop while an animation
    * is active.
    *
    * @param deltaMs  Milliseconds elapsed since the previous `tick()` call.
@@ -135,14 +135,15 @@ export class AnimationController {
     const rawFrame = Math.floor(this.elapsedMs / msPerFrame);
 
     let justCompleted = false;
+    const frameCount = this.animDef.frameCount ?? 1;
 
     if (this.looping) {
       // Looping: wrap frame index indefinitely.
-      this.currentFrameIndex = rawFrame % this.animDef.frameCount;
+      this.currentFrameIndex = rawFrame % frameCount;
     } else {
       // One-shot: clamp to last frame and signal completion once.
-      if (rawFrame >= this.animDef.frameCount) {
-        this.currentFrameIndex = this.animDef.frameCount - 1;
+      if (rawFrame >= frameCount) {
+        this.currentFrameIndex = frameCount - 1;
         if (!this.complete) {
           this.complete = true;
           justCompleted = true;

@@ -23,6 +23,7 @@ export const ReminderCard: React.FC<ReminderCardProps> = ({ isMounted, children 
         maxWidth: "90%",
         fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif",
         textAlign: "center",
+        pointerEvents: "auto",
       }}
     >
       {children}

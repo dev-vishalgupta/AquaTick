@@ -3,7 +3,7 @@
 use tauri::State;
 
 use crate::errors::CommandError;
-use crate::models::{DailyStatistic, WeeklyStatistic};
+use crate::models::{DailyStatistic, WeeklyStatistic, DashboardRange, DashboardResponseDTO};
 use crate::services::StatisticsService;
 use crate::state::AppState;
 
@@ -31,4 +31,25 @@ pub async fn get_weekly_statistics(
         .map_err(CommandError::from)?;
 
     Ok(stats)
+}
+
+/// Generates the complete Statistics Dashboard data.
+#[tauri::command]
+pub async fn get_dashboard(
+    state: State<'_, AppState>,
+    range: DashboardRange,
+) -> Result<DashboardResponseDTO, CommandError> {
+    let active_ms_today = {
+        let guard = state.active_ms_today.lock().map_err(|e| CommandError {
+            code: "MUTEX_ERROR".to_string(),
+            message: e.to_string(),
+        })?;
+        *guard
+    };
+
+    let dashboard = StatisticsService::generate_dashboard(&state.db, range, active_ms_today)
+        .await
+        .map_err(CommandError::from)?;
+
+    Ok(dashboard)
 }

@@ -136,11 +136,16 @@ export class CharacterStateMachine {
         this.movementController.stop();
         break;
 
-      case "Entering":
-        // Reset movement on entry; animation stops until walk starts
-        this.animationController.stop();
+      case "Entering": {
+        const idleDef = this.metadata?.animations["idle"];
+        if (idleDef) {
+          this.animationController.play(idleDef, { loop: true });
+        } else {
+          this.animationController.stop();
+        }
         this.movementController.stop();
         break;
+      }
 
       case "Walking": {
         const walkDef = this.metadata?.animations["walk"];

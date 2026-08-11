@@ -88,6 +88,10 @@ pub struct AppSettings {
     /// 0.0 – 1.0 (displayed to user as percentage)
     pub sound_volume: f64,
     pub character_id: String,
+    pub character_scale: String,
+    pub start_on_boot: bool,
+    pub target_mode: String,
+    pub manual_target_reminders: i64,
 }
 
 impl Default for AppSettings {
@@ -101,6 +105,10 @@ impl Default for AppSettings {
             sound_enabled: DEFAULT_SOUND_ENABLED,
             sound_volume: DEFAULT_SOUND_VOLUME,
             character_id: DEFAULT_CHARACTER_ID.to_string(),
+            character_scale: DEFAULT_CHARACTER_SCALE.to_string(),
+            start_on_boot: DEFAULT_START_ON_BOOT,
+            target_mode: DEFAULT_TARGET_MODE.to_string(),
+            manual_target_reminders: DEFAULT_MANUAL_TARGET_REMINDERS,
         }
     }
 }

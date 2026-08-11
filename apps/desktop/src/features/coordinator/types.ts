@@ -10,7 +10,11 @@ export type EventType =
   | "session:snoozed"
   | "session:timedOut"
   | "settings:changed"
-  | "character:changed";
+  | "character:changed"
+  | "reminder:presented"
+  | "presentation:ready"
+  | "reminder:dismissed"
+  | "presentation:closed";
 
 export interface SessionTriggeredPayload {
   sessionId: string;
@@ -30,10 +34,24 @@ export interface SessionTimedOutPayload {
   sessionId: string;
 }
 
-export interface AppSettings {
-  volume: number;
-  intervalMinutes: number;
-  selectedCharacterId: string;
+export interface ReminderPresentedPayload {
+  sessionId: string;
+}
+
+export interface PresentationReadyPayload {
+  componentId: string;
+}
+
+export interface ReminderDismissedPayload {}
+
+export interface PresentationClosedPayload {
+  componentId: string;
+  reason?: string;
+}
+
+import type { SettingsData } from "../settings/types";
+
+export interface AppSettings extends SettingsData {
   [key: string]: any;
 }
 
@@ -55,6 +73,10 @@ export interface EventPayloadMap {
   "session:timedOut": SessionTimedOutPayload;
   "settings:changed": SettingsChangedPayload;
   "character:changed": CharacterChangedPayload;
+  "reminder:presented": ReminderPresentedPayload;
+  "presentation:ready": PresentationReadyPayload;
+  "reminder:dismissed": ReminderDismissedPayload;
+  "presentation:closed": PresentationClosedPayload;
 }
 
 export type EventPayload<T extends EventType> = EventPayloadMap[T];

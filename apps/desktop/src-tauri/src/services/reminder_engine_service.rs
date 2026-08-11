@@ -60,8 +60,9 @@ use tokio::task::AbortHandle;
 
 use crate::constants::DEFAULT_SESSION_TIMEOUT_MINUTES;
 use crate::errors::AppResult;
-use crate::models::AppSettings;
-use crate::services::{scheduler_service::OnReminderDue, SchedulerService, SessionService};
+use crate::models::{AppSettings, SessionStatus};
+use crate::repositories::SessionRepository;
+use crate::services::{scheduler_service::OnReminderDue, SchedulerService, SessionService, StatisticsService};
 
 // -- Engine state --------------------------------------------------------------
 
@@ -186,256 +187,247 @@ impl ReminderEngineService {
 
     /// Handles a reminder-due notification from the `SchedulerService`.
     ///
-    /// Creates a pending session, marks it triggered, and starts the session
-    /// timeout timer. If a session is already active, the notification is
-    /// discarded (guards against concurrent triggers).
+    /// If engine state is Idle, creates a pending session and triggers it.
+    /// If engine state is Snoozed, re-triggers the existing active session.
+    /// If engine state is SessionActive, the notification is discarded.
     ///
     /// Called from within the `OnReminderDue` callback — must not block.
     pub fn handle_reminder_due(
         &self,
         pool: Pool<Sqlite>,
-        settings: AppSettings,
         scheduler: SchedulerService,
     ) {
-        // Guard: only one active session permitted.
-        {
+        let (state, active_id) = {
             let guard = match self.inner.lock() {
-                Ok(g)  => g,
+                Ok(g)  => (g.engine_state.clone(), g.active_session_id),
                 Err(e) => {
                     log::error!("ReminderEngine: lock failed in handle_reminder_due(): {}", e);
                     return;
                 }
             };
-            if guard.engine_state != EngineState::Idle {
-                log::warn!(
-                    "ReminderEngine: handle_reminder_due() called while in state '{}' — discarding.",
-                    guard.engine_state
-                );
-                return;
-            }
+            (guard.0, guard.1)
+        };
+
+        if state == EngineState::SessionActive {
+            log::warn!("ReminderEngine: handle_reminder_due() called while in SessionActive state — discarding.");
+            return;
         }
 
-        log::info!("ReminderEngine: Reminder due. Starting session creation.");
+        log::info!("ReminderEngine: Reminder due. Engine state: '{}', active_session: {:?}", state, active_id);
 
         let engine = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = engine.create_and_trigger_session(&pool, &settings, scheduler).await {
-                log::error!("ReminderEngine: failed to create/trigger session: {}", e);
+            if state == EngineState::Snoozed {
+                if let Some(id) = active_id {
+                    if let Err(e) = engine.retrigger_snoozed_session(&pool, id, &scheduler).await {
+                        log::error!("ReminderEngine: failed to re-trigger snoozed session: {}", e);
+                    }
+                }
+            } else {
+                if let Err(e) = engine.create_and_trigger_session(&pool, scheduler).await {
+                    log::error!("ReminderEngine: failed to create/trigger session: {}", e);
+                }
             }
         });
     }
 
     /// Resolves the active session as `completed`.
-    ///
-    /// Valid from `SessionActive` only. Returns an error for invalid transitions
-    /// or if no session is active.
     pub async fn complete_session(
         &self,
         pool: &Pool<Sqlite>,
         session_id: i64,
+        active_ms_today: i64,
         scheduler: &SchedulerService,
     ) -> AppResult<()> {
-        let active_id = self.validate_active_session(session_id, "complete_session")?;
-
-        log::info!("ReminderEngine: Completing session ID {}.", active_id);
-
-        // Cancel timeout timer before DB write.
-        self.cancel_timeout_timer();
-
-        // Mark session completed in the DB.
-        SessionService::complete(pool, active_id).await?;
-
-        // Clear engine state.
-        self.clear_session_state(EngineState::Idle);
-
-        log::info!("ReminderEngine: Session {} completed.", active_id);
-
-        // Emit session:completed event to frontend
-        {
-            use tauri::Emitter;
-            if let Ok(guard) = self.inner.lock() {
-                if let Some(app) = &guard.app_handle {
-                    #[derive(serde::Serialize, Clone)]
-                    struct CompletedPayload {
-                        #[serde(rename = "sessionId")]
-                        session_id: String,
-                    }
-                    let payload = CompletedPayload {
-                        session_id: active_id.to_string(),
-                    };
-                    app.emit("session:completed", payload).ok();
-                }
-            }
-        }
-
-        // Restart the scheduler for the next reminder cycle.
-        scheduler.reset().await;
-        log::info!("ReminderEngine: Scheduler reset after session completion.");
-
-        Ok(())
+        self.resolve_session(
+            pool,
+            session_id,
+            SessionStatus::Completed,
+            active_ms_today,
+            None,
+            scheduler,
+        )
+        .await
     }
 
     /// Snoozes the active session.
-    ///
-    /// Valid from `SessionActive` only. Increments the snooze count, transitions
-    /// the session to `snoozed`, and schedules the snooze timer. When the snooze
-    /// timer fires, the session is re-triggered.
     pub async fn snooze_session(
         &self,
         pool: &Pool<Sqlite>,
         session_id: i64,
         delay_minutes: i64,
-        settings: &AppSettings,
         scheduler: &SchedulerService,
     ) -> AppResult<()> {
-        let active_id = self.validate_active_session(session_id, "snooze_session")?;
-
-        log::info!("ReminderEngine: Snoozing session ID {} for {} minutes.", active_id, delay_minutes);
-
-        // Cancel running timeout.
-        self.cancel_timeout_timer();
-
-        // Transition session to snoozed in DB.
-        SessionService::snooze(pool, active_id).await?;
-
-        // Transition engine state to Snoozed.
-        {
-            let mut guard = match self.inner.lock() {
-                Ok(g)  => g,
-                Err(e) => {
-                    log::error!("ReminderEngine: lock failed transitioning to Snoozed: {}", e);
-                    return Err(crate::errors::AppError::Internal(e.to_string()));
-                }
-            };
-            guard.engine_state = EngineState::Snoozed;
-        }
-
-        log::info!("ReminderEngine: Session {} snoozed.", active_id);
-
-        // Emit session:snoozed event to frontend
-        {
-            use tauri::Emitter;
-            if let Ok(guard) = self.inner.lock() {
-                if let Some(app) = &guard.app_handle {
-                    #[derive(serde::Serialize, Clone)]
-                    struct SnoozedPayload {
-                        #[serde(rename = "sessionId")]
-                        session_id: String,
-                        #[serde(rename = "durationMin")]
-                        duration_min: i64,
-                    }
-                    let payload = SnoozedPayload {
-                        session_id: active_id.to_string(),
-                        duration_min: delay_minutes,
-                    };
-                    app.emit("session:snoozed", payload).ok();
-                }
-            }
-        }
-
-        // Spawn the snooze timer.
-        let snooze_handle = self.spawn_snooze_timer(
-            pool.clone(),
-            active_id,
-            delay_minutes,
-            settings.clone(),
-            scheduler.clone(),
-        );
-
-        // Store the snooze handle.
-        match self.inner.lock() {
-            Ok(mut g) => {
-                g.cancel_snooze();
-                g.snooze_handle = Some(snooze_handle);
-            }
-            Err(e) => {
-                log::error!("ReminderEngine: failed to store snooze handle: {}", e);
-            }
-        }
-
-        Ok(())
+        self.resolve_session(
+            pool,
+            session_id,
+            SessionStatus::Snoozed,
+            -1, // Snooze is not terminal; stats ignored
+            Some(delay_minutes),
+            scheduler,
+        )
+        .await
     }
 
-    /// Transitions the active session to `timed_out` and resets the scheduler.
-    ///
-    /// Called by the internal timeout timer or during shutdown.
+    /// Transitions the active session to `timed_out` (engine timeout decision).
     pub async fn timeout_session(
         &self,
         pool: &Pool<Sqlite>,
         session_id: i64,
+        active_ms_today: i64,
         scheduler: &SchedulerService,
     ) -> AppResult<()> {
-        // A timeout can fire from SessionActive; allow it even if state was cleared.
+        self.resolve_session(
+            pool,
+            session_id,
+            SessionStatus::TimedOut,
+            active_ms_today,
+            None,
+            scheduler,
+        )
+        .await
+    }
+
+    /// Resolves the active session as `ignored` (explicit user dismiss action).
+    pub async fn ignore_session(
+        &self,
+        pool: &Pool<Sqlite>,
+        session_id: i64,
+        active_ms_today: i64,
+        scheduler: &SchedulerService,
+    ) -> AppResult<()> {
+        self.resolve_session(
+            pool,
+            session_id,
+            SessionStatus::Ignored,
+            active_ms_today,
+            None,
+            scheduler,
+        )
+        .await
+    }
+
+    /// Core orchestrator for session resolution.
+    /// Ensures atomic transaction commit and strict ordering:
+    /// Validation -> Persistence -> Statistics -> Commit -> Scheduler Handoff -> Presentation Notification -> Completed.
+    async fn resolve_session(
+        &self,
+        pool: &Pool<Sqlite>,
+        session_id: i64,
+        target_status: SessionStatus,
+        active_ms_today: i64,
+        snooze_delay_minutes: Option<i64>,
+        scheduler: &SchedulerService,
+    ) -> AppResult<()> {
+        log::info!("ReminderEngine: Resolution Requested for session {} to status '{}'.", session_id, target_status);
+
+        // 1. Validation (Idempotency & state protection)
         let active_id = {
             let guard = match self.inner.lock() {
-                Ok(g)  => g,
-                Err(e) => {
-                    return Err(crate::errors::AppError::Internal(e.to_string()));
-                }
+                Ok(g) => g,
+                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
             };
-            guard.active_session_id
-        };
 
-        let active_id = match active_id {
-            Some(id) if id == session_id => id,
-            Some(other) => {
-                log::warn!(
-                    "ReminderEngine: timeout_session() called for ID {} but active is {:?} — ignoring.",
-                    session_id, other
-                );
+            // Protect against duplicate button clicks / IPC events
+            if guard.engine_state == EngineState::Idle {
+                log::warn!("ReminderEngine: resolve_session() called but engine is Idle — ignoring request.");
                 return Ok(());
             }
-            None => {
-                log::warn!(
-                    "ReminderEngine: timeout_session() called but no active session — ignoring."
-                );
+
+            if guard.engine_state == EngineState::Snoozed && target_status == SessionStatus::Snoozed {
+                log::warn!("ReminderEngine: resolve_session() snooze called but already Snoozed — ignoring request.");
                 return Ok(());
             }
-        };
 
-        log::info!("ReminderEngine: Session {} timed out.", active_id);
-
-        // Cancel any remaining timers.
-        self.cancel_timeout_timer();
-        self.cancel_snooze_timer();
-
-        // Mark session timed_out in DB.
-        SessionService::mark_timed_out(pool, active_id).await?;
-
-        // Clear engine state.
-        self.clear_session_state(EngineState::Idle);
-
-        log::info!("ReminderEngine: Session {} transitioned to timed_out.", active_id);
-
-        // Emit session:timedOut event to frontend
-        {
-            use tauri::Emitter;
-            if let Ok(guard) = self.inner.lock() {
-                if let Some(app) = &guard.app_handle {
-                    #[derive(serde::Serialize, Clone)]
-                    struct TimedOutPayload {
-                        #[serde(rename = "sessionId")]
-                        session_id: String,
-                    }
-                    let payload = TimedOutPayload {
-                        session_id: active_id.to_string(),
-                    };
-                    app.emit("session:timedOut", payload).ok();
+            match guard.active_session_id {
+                Some(id) if id == session_id => id,
+                Some(other) => {
+                    log::warn!(
+                        "ReminderEngine: resolve_session() session_id {} does not match active session {} — ignoring request.",
+                        session_id, other
+                    );
+                    return Ok(()); // Exactly-once resolution: ignore mismatched ID
+                }
+                None => {
+                    return Err(crate::errors::AppError::Internal(
+                        "ReminderEngine: resolve_session() — no active session ID in non-Idle state.".into()
+                    ));
                 }
             }
+        };
+
+        // Cancel timeout timer immediately.
+        self.cancel_timeout_timer();
+
+        // 2. Transaction Boundary
+        let mut tx = pool.begin().await?;
+
+        // 3. Persistence
+        let session = SessionRepository::get_by_id(&mut *tx, active_id)
+            .await?
+            .ok_or_else(|| crate::errors::AppError::NotFound(format!("Session {} not found", active_id)))?;
+
+        let current_status = std::str::FromStr::from_str(&session.status)?;
+        SessionService::validate_transition(&current_status, &target_status)?;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if target_status == SessionStatus::Snoozed {
+            SessionRepository::update_status(&mut *tx, active_id, target_status.clone(), None, now_ms).await?;
+            SessionRepository::increment_snooze(&mut *tx, active_id, now_ms).await?;
+        } else {
+            SessionRepository::update_status(&mut *tx, active_id, target_status.clone(), Some(now_ms), now_ms).await?;
         }
 
-        // Restart the scheduler.
-        scheduler.reset().await;
-        log::info!("ReminderEngine: Scheduler reset after session timeout.");
+        // 4. Statistics
+        if target_status == SessionStatus::Completed
+            || target_status == SessionStatus::TimedOut
+            || target_status == SessionStatus::Ignored
+        {
+            let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            // Fetch settings to get interval minutes
+            let settings = crate::services::SettingsService::load_all(pool).await.unwrap_or_default();
+            
+            StatisticsService::recompute_for_date(
+                &mut *tx,
+                &today_str,
+                active_ms_today,
+                settings.reminder_interval_minutes,
+            )
+            .await?;
+        }
+
+        // 5. Commit
+        tx.commit().await?;
+        log::info!("ReminderEngine: Session {} transaction committed with status '{}'.", active_id, target_status);
+
+        // 6. Scheduler Handoff
+        scheduler.report_resolution(&target_status, snooze_delay_minutes, pool).await;
+
+        // 7. Presentation & Business Notifications
+        self.emit_outcome_events(active_id, &target_status, snooze_delay_minutes);
+
+        // 8. Completed: Update internal engine state
+        let next_engine_state = if target_status == SessionStatus::Snoozed {
+            EngineState::Snoozed
+        } else {
+            EngineState::Idle
+        };
+
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
+            };
+            guard.engine_state = next_engine_state;
+            if target_status != SessionStatus::Snoozed {
+                guard.active_session_id = None;
+            }
+        }
 
         Ok(())
     }
 
     /// Cancels the active session during application shutdown.
-    ///
-    /// Forces any `triggered` or `snoozed` session to `timed_out` without
-    /// restarting the scheduler (application is shutting down).
     pub async fn cancel_active_session(&self, pool: &Pool<Sqlite>) {
         let active_id = {
             let mut guard = match self.inner.lock() {
@@ -450,18 +442,36 @@ impl ReminderEngineService {
 
         if let Some(id) = active_id {
             log::info!("ReminderEngine: Cancelling active session {} on shutdown.", id);
-            if let Err(e) = SessionService::mark_timed_out(pool, id).await {
+            let mut conn = match pool.acquire().await {
+                Ok(c) => c,
+                Err(e) => { log::error!("ReminderEngine: failed to acquire connection: {}", e); return; }
+            };
+            
+            if let Err(e) = SessionRepository::update_status(
+                &mut conn,
+                id,
+                SessionStatus::TimedOut,
+                Some(chrono::Utc::now().timestamp_millis()),
+                chrono::Utc::now().timestamp_millis()
+            ).await {
                 log::error!("ReminderEngine: failed to cancel session {} on shutdown: {}", id, e);
             }
+
+            // Emit presentation dismissed
+            {
+                use tauri::Emitter;
+                if let Ok(guard) = self.inner.lock() {
+                    if let Some(app) = &guard.app_handle {
+                        app.emit("reminder:dismissed", ()).ok();
+                    }
+                }
+            }
+
             self.clear_session_state(EngineState::Idle);
         }
     }
 
     /// Recovers stale sessions from a previous crash or unexpected shutdown.
-    ///
-    /// Any sessions left in `triggered` status longer than `DEFAULT_SESSION_TIMEOUT_MINUTES`
-    /// are resolved as `timed_out`. Called once at application startup before the
-    /// first scheduler start.
     pub async fn recover_stale_sessions(&self, pool: &Pool<Sqlite>) {
         log::info!("ReminderEngine: Starting stale session recovery.");
 
@@ -483,14 +493,59 @@ impl ReminderEngineService {
 
     // -- Private helpers -------------------------------------------------------
 
+    /// Re-triggers a snoozed session.
+    async fn retrigger_snoozed_session(
+        &self,
+        pool: &Pool<Sqlite>,
+        session_id: i64,
+        scheduler: &SchedulerService,
+    ) -> AppResult<()> {
+        log::info!("ReminderEngine: Re-triggering snoozed session ID {}.", session_id);
+
+        let mut conn = pool.acquire().await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        SessionRepository::update_triggered(&mut conn, session_id, SessionStatus::Triggered, now_ms, now_ms).await?;
+
+        // Transition engine state to SessionActive.
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g)  => g,
+                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
+            };
+            guard.engine_state = EngineState::SessionActive;
+        }
+
+        // Emit trigger events
+        self.emit_trigger_events(session_id);
+
+        // Start a fresh timeout timer.
+        let timeout_handle = self.spawn_timeout_timer(
+            pool.clone(),
+            session_id,
+            DEFAULT_SESSION_TIMEOUT_MINUTES,
+            scheduler.clone(),
+        );
+
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.cancel_timeout();
+            guard.timeout_handle = Some(timeout_handle);
+        }
+
+        log::info!("ReminderEngine: Session {} active again (post-snooze). Timeout timer started.", session_id);
+
+        Ok(())
+    }
+
     /// Creates a pending session, marks it triggered, and starts the timeout timer.
     async fn create_and_trigger_session(
         &self,
         pool: &Pool<Sqlite>,
-        settings: &AppSettings,
         scheduler: SchedulerService,
     ) -> AppResult<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let settings = crate::services::SettingsService::load_all(pool).await.unwrap_or_default();
+
+        let mut conn = pool.acquire().await?;
 
         // Create pending session.
         let session = SessionService::create_pending(
@@ -498,38 +553,17 @@ impl ReminderEngineService {
             now_ms,
             settings.reminder_interval_minutes,
             settings.character_id.clone(),
-            None, // sound_id: deferred to Reminder Engine Phase 4D (sound system)
+            None,
         )
         .await?;
 
         log::info!("ReminderEngine: Created pending session ID {}.", session.id);
 
-        // Transition pending ? triggered.
-        SessionService::mark_triggered(pool, session.id).await?;
+        // Transition pending -> triggered.
+        SessionRepository::update_triggered(&mut conn, session.id, SessionStatus::Triggered, now_ms, now_ms).await?;
         log::info!("ReminderEngine: Session {} triggered.", session.id);
 
         let session_id = session.id;
-
-        // Emit session:triggered event to frontend
-        {
-            use tauri::Emitter;
-            if let Ok(guard) = self.inner.lock() {
-                if let Some(app) = &guard.app_handle {
-                    #[derive(serde::Serialize, Clone)]
-                    struct TriggeredPayload {
-                        #[serde(rename = "sessionId")]
-                        session_id: String,
-                        #[serde(rename = "dueAt")]
-                        due_at: String,
-                    }
-                    let payload = TriggeredPayload {
-                        session_id: session_id.to_string(),
-                        due_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    app.emit("session:triggered", payload).ok();
-                }
-            }
-        }
 
         // Store active session and transition engine state.
         {
@@ -537,10 +571,13 @@ impl ReminderEngineService {
                 Ok(g)  => g,
                 Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
             };
-            guard.cancel_timeout(); // safety: should be None, but be defensive
+            guard.cancel_timeout();
             guard.active_session_id = Some(session_id);
             guard.engine_state      = EngineState::SessionActive;
         }
+
+        // Emit events
+        self.emit_trigger_events(session_id);
 
         // Start the session timeout timer.
         let timeout_handle = self.spawn_timeout_timer(
@@ -550,14 +587,9 @@ impl ReminderEngineService {
             scheduler.clone(),
         );
 
-        match self.inner.lock() {
-            Ok(mut g) => {
-                g.cancel_timeout();
-                g.timeout_handle = Some(timeout_handle);
-            }
-            Err(e) => {
-                log::error!("ReminderEngine: failed to store timeout handle: {}", e);
-            }
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.cancel_timeout();
+            guard.timeout_handle = Some(timeout_handle);
         }
 
         log::info!("ReminderEngine: Session {} active. Timeout timer started ({} min).",
@@ -581,7 +613,8 @@ impl ReminderEngineService {
             tokio::time::sleep(duration).await;
             log::info!("ReminderEngine: Timeout timer fired for session {}.", session_id);
 
-            if let Err(e) = engine.timeout_session(&pool, session_id, &scheduler).await {
+            // Since it's a timeout timer, we don't have active_ms_today, so we pass -1
+            if let Err(e) = engine.timeout_session(&pool, session_id, -1, &scheduler).await {
                 log::error!("ReminderEngine: timeout_session failed for {}: {}", session_id, e);
             }
         });
@@ -589,149 +622,99 @@ impl ReminderEngineService {
         task.abort_handle()
     }
 
-    /// Spawns an async task that re-triggers the session after the snooze delay.
-    fn spawn_snooze_timer(
-        &self,
-        pool:          Pool<Sqlite>,
-        session_id:    i64,
-        delay_minutes: i64,
-        settings:      AppSettings,
-        scheduler:     SchedulerService,
-    ) -> AbortHandle {
-        let engine   = self.clone();
-        let duration = Duration::from_secs((delay_minutes as u64).saturating_mul(60));
-
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            log::info!("ReminderEngine: Snooze timer fired for session {}.", session_id);
-
-            if let Err(e) = engine.handle_snooze_expired(&pool, session_id, &settings, &scheduler).await {
-                log::error!("ReminderEngine: snooze re-trigger failed for {}: {}", session_id, e);
-            }
-        });
-
-        task.abort_handle()
-    }
-
-    /// Re-triggers a snoozed session: transitions `snoozed ? triggered` and restarts
-    /// the timeout timer. Same session ID, snooze_count already incremented.
-    async fn handle_snooze_expired(
-        &self,
-        pool:      &Pool<Sqlite>,
-        session_id: i64,
-        settings:  &AppSettings,
-        scheduler: &SchedulerService,
-    ) -> AppResult<()> {
-        // Verify the engine is still in Snoozed state for this session.
-        {
-            let guard = match self.inner.lock() {
-                Ok(g)  => g,
-                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
-            };
-
-            if guard.engine_state != EngineState::Snoozed {
-                log::warn!(
-                    "ReminderEngine: snooze expired but engine state is '{}' — ignoring.",
-                    guard.engine_state
-                );
-                return Ok(());
-            }
-
-            if guard.active_session_id != Some(session_id) {
-                log::warn!(
-                    "ReminderEngine: snooze expired for session {} but active is {:?} — ignoring.",
-                    session_id, guard.active_session_id
-                );
-                return Ok(());
-            }
-        }
-
-        // Transition snoozed ? triggered in the DB.
-        SessionService::mark_triggered(pool, session_id).await?;
-        log::info!("ReminderEngine: Session {} re-triggered after snooze.", session_id);
-
-        // Emit session:triggered event to frontend
-        {
-            use tauri::Emitter;
-            if let Ok(guard) = self.inner.lock() {
-                if let Some(app) = &guard.app_handle {
-                    #[derive(serde::Serialize, Clone)]
-                    struct TriggeredPayload {
-                        #[serde(rename = "sessionId")]
-                        session_id: String,
-                        #[serde(rename = "dueAt")]
-                        due_at: String,
-                    }
-                    let payload = TriggeredPayload {
-                        session_id: session_id.to_string(),
-                        due_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    app.emit("session:triggered", payload).ok();
+    /// Emits IPC trigger/presented events to the frontend.
+    fn emit_trigger_events(&self, session_id: i64) {
+        use tauri::Emitter;
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(app) = &guard.app_handle {
+                #[derive(serde::Serialize, Clone)]
+                struct PresentedPayload {
+                    #[serde(rename = "sessionId")]
+                    session_id: String,
                 }
+                let payload = PresentedPayload {
+                    session_id: session_id.to_string(),
+                };
+                app.emit("reminder:presented", payload).ok();
+
+                #[derive(serde::Serialize, Clone)]
+                struct TriggeredPayload {
+                    #[serde(rename = "sessionId")]
+                    session_id: String,
+                    #[serde(rename = "dueAt")]
+                    due_at: String,
+                }
+                let triggered_payload = TriggeredPayload {
+                    session_id: session_id.to_string(),
+                    due_at: chrono::Utc::now().to_rfc3339(),
+                };
+                app.emit("session:triggered", triggered_payload).ok();
             }
         }
-
-        // Transition engine state back to SessionActive.
-        {
-            let mut guard = match self.inner.lock() {
-                Ok(g)  => g,
-                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
-            };
-            guard.cancel_snooze();
-            guard.engine_state = EngineState::SessionActive;
-        }
-
-        // Start a fresh timeout timer.
-        let timeout_handle = self.spawn_timeout_timer(
-            pool.clone(),
-            session_id,
-            DEFAULT_SESSION_TIMEOUT_MINUTES,
-            scheduler.clone(),
-        );
-
-        match self.inner.lock() {
-            Ok(mut g) => {
-                g.cancel_timeout();
-                g.timeout_handle = Some(timeout_handle);
-            }
-            Err(e) => {
-                log::error!("ReminderEngine: failed to store timeout handle after snooze: {}", e);
-            }
-        }
-
-        log::info!("ReminderEngine: Session {} active again (post-snooze). Timeout timer started.",
-            session_id);
-
-        let _ = settings; // reserved for future use (e.g. re-reading interval on resume)
-        let _ = scheduler;
-        Ok(())
     }
 
-    /// Validates that `session_id` matches the currently active session and
-    /// that the engine is in `SessionActive`. Returns the confirmed active ID.
-    fn validate_active_session(&self, session_id: i64, caller: &str) -> AppResult<i64> {
-        let guard = match self.inner.lock() {
-            Ok(g)  => g,
-            Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
-        };
+    /// Emits outcome events and presentation dismiss notifications.
+    fn emit_outcome_events(
+        &self,
+        session_id: i64,
+        status: &SessionStatus,
+        snooze_delay_minutes: Option<i64>,
+    ) {
+        use tauri::Emitter;
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(app) = &guard.app_handle {
+                // 1. Emit the specific business event
+                match status {
+                    SessionStatus::Completed => {
+                        #[derive(serde::Serialize, Clone)]
+                        struct CompletedPayload {
+                            #[serde(rename = "sessionId")]
+                            session_id: String,
+                        }
+                        app.emit("session:completed", CompletedPayload {
+                            session_id: session_id.to_string(),
+                        }).ok();
+                    }
+                    SessionStatus::Snoozed => {
+                        #[derive(serde::Serialize, Clone)]
+                        struct SnoozedPayload {
+                            #[serde(rename = "sessionId")]
+                            session_id: String,
+                            #[serde(rename = "durationMin")]
+                            duration_min: i64,
+                        }
+                        let delay = snooze_delay_minutes.unwrap_or(crate::constants::DEFAULT_SNOOZE_DURATION_MINUTES);
+                        app.emit("session:snoozed", SnoozedPayload {
+                            session_id: session_id.to_string(),
+                            duration_min: delay,
+                        }).ok();
+                    }
+                    SessionStatus::TimedOut => {
+                        #[derive(serde::Serialize, Clone)]
+                        struct TimedOutPayload {
+                            #[serde(rename = "sessionId")]
+                            session_id: String,
+                        }
+                        app.emit("session:timedOut", TimedOutPayload {
+                            session_id: session_id.to_string(),
+                        }).ok();
+                    }
+                    SessionStatus::Ignored => {
+                        #[derive(serde::Serialize, Clone)]
+                        struct IgnoredPayload {
+                            #[serde(rename = "sessionId")]
+                            session_id: String,
+                        }
+                        app.emit("session:ignored", IgnoredPayload {
+                            session_id: session_id.to_string(),
+                        }).ok();
+                    }
+                    _ => {}
+                }
 
-        if guard.engine_state != EngineState::SessionActive {
-            return Err(crate::errors::AppError::Validation(format!(
-                "ReminderEngine: {}() called while in state '{}' — expected SessionActive.",
-                caller, guard.engine_state
-            )));
-        }
-
-        match guard.active_session_id {
-            Some(id) if id == session_id => Ok(id),
-            Some(other) => Err(crate::errors::AppError::Validation(format!(
-                "ReminderEngine: {}() session_id {} does not match active session {}.",
-                caller, session_id, other
-            ))),
-            None => Err(crate::errors::AppError::Internal(format!(
-                "ReminderEngine: {}() — no active session ID despite SessionActive state.",
-                caller
-            ))),
+                // 2. Emit the visual presentation dismiss event
+                app.emit("reminder:dismissed", ()).ok();
+            }
         }
     }
 
@@ -757,14 +740,6 @@ impl ReminderEngineService {
             Err(e)    => log::error!("ReminderEngine: failed to cancel timeout: {}", e),
         }
     }
-
-    /// Cancels the snooze timer (does not modify other state).
-    fn cancel_snooze_timer(&self) {
-        match self.inner.lock() {
-            Ok(mut g) => g.cancel_snooze(),
-            Err(e)    => log::error!("ReminderEngine: failed to cancel snooze: {}", e),
-        }
-    }
 }
 
 impl Default for ReminderEngineService {
@@ -774,17 +749,12 @@ impl Default for ReminderEngineService {
 // -- Engine callback builder ---------------------------------------------------
 
 /// Builds the `OnReminderDue` callback that wires the scheduler to the engine.
-///
-/// Called once during application startup to construct the closure passed to
-/// `SchedulerService::start()`. The closure captures a clone of `ReminderEngineService`,
-/// the db pool, and the current settings snapshot.
 pub fn build_reminder_due_callback(
     engine:    ReminderEngineService,
     pool:      Pool<Sqlite>,
-    settings:  AppSettings,
     scheduler: SchedulerService,
 ) -> OnReminderDue {
     Arc::new(move || {
-        engine.handle_reminder_due(pool.clone(), settings.clone(), scheduler.clone());
+        engine.handle_reminder_due(pool.clone(), scheduler.clone());
     })
 }

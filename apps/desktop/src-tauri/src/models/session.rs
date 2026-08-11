@@ -25,6 +25,7 @@ pub enum SessionStatus {
     Completed,
     Snoozed,
     TimedOut,
+    Ignored,
 }
 
 impl SessionStatus {
@@ -36,6 +37,7 @@ impl SessionStatus {
             Self::Completed => "completed",
             Self::Snoozed   => "snoozed",
             Self::TimedOut  => "timed_out",
+            Self::Ignored   => "ignored",
         }
     }
 
@@ -44,7 +46,7 @@ impl SessionStatus {
     /// # Invariant S-2
     /// A session in a final state must never change status again.
     pub fn is_final(&self) -> bool {
-        matches!(self, Self::Completed | Self::TimedOut)
+        matches!(self, Self::Completed | Self::TimedOut | Self::Ignored)
     }
 }
 
@@ -64,9 +66,10 @@ impl std::str::FromStr for SessionStatus {
             "completed" => Ok(Self::Completed),
             "snoozed"   => Ok(Self::Snoozed),
             "timed_out" => Ok(Self::TimedOut),
+            "ignored"   => Ok(Self::Ignored),
             other => Err(crate::errors::AppError::Validation(format!(
                 "Unknown session status: '{}'. \
-                 Expected: pending | triggered | completed | snoozed | timed_out",
+                 Expected: pending | triggered | completed | snoozed | timed_out | ignored",
                 other
             ))),
         }

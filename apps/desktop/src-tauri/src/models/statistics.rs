@@ -21,7 +21,7 @@ pub struct DailyStatistic {
     pub id: i64,
     /// ISO-8601 calendar date: `"YYYY-MM-DD"`.
     pub date: String,
-    /// Total sessions that reached a final status (`completed` or `timed_out`).
+    /// Total sessions that reached a final status (`completed`, `timed_out`, or `ignored`).
     pub total_sessions: i64,
     /// Sessions where the user confirmed drinking.
     pub completed_count: i64,
@@ -29,6 +29,8 @@ pub struct DailyStatistic {
     pub snoozed_count: i64,
     /// Sessions that expired without any user response.
     pub timed_out_count: i64,
+    /// Sessions explicitly ignored by the user.
+    pub ignored_count: i64,
     /// `(completed_count / total_sessions) * 100.0`. `0.0` when `total_sessions == 0`.
     pub completion_percentage: f64,
     /// Auto-calculated: `active_minutes_today / interval_minutes`. Never user-input.
@@ -37,6 +39,8 @@ pub struct DailyStatistic {
     pub goal_met: i64,
     /// Consecutive day number in the current completion streak ending this date.
     pub streak_day: i64,
+    /// Accumulated working time in milliseconds.
+    pub working_time_ms: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -54,10 +58,12 @@ impl DailyStatistic {
             completed_count: 0,
             snoozed_count: 0,
             timed_out_count: 0,
+            ignored_count: 0,
             completion_percentage: 0.0,
             expected_sessions: 0,
             goal_met: 0,
             streak_day: 0,
+            working_time_ms: 0,
             created_at: now_ms,
             updated_at: now_ms,
         }

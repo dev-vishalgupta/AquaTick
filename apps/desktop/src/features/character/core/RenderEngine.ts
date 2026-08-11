@@ -138,13 +138,13 @@ export class RenderEngine {
     // Clamp frameIndex to valid range to prevent drawing outside the sheet.
     const clampedFrame = Math.max(
       0,
-      Math.min(Math.floor(frameIndex), animDef.frameCount - 1),
+      Math.min(Math.floor(frameIndex), (animDef.frameCount || 1) - 1),
     );
 
     // -- Source rectangle (pixels in the sprite sheet) -----------------------
 
     const sx = clampedFrame * meta.frameWidth;
-    const sy = animDef.row * meta.frameHeight;
+    const sy = (animDef.row || 0) * meta.frameHeight;
     const sw = meta.frameWidth;
     const sh = meta.frameHeight;
 

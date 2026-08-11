@@ -19,6 +19,7 @@
 import { useEffect, useRef, forwardRef, useImperativeHandle } from "react";
 import type { CharacterSystemAPI } from "../types";
 import { CharacterController } from "../core/CharacterController";
+import type { SettingsData } from "../../settings/types";
 
 // ---------------------------------------------------------------------------
 // Public handle type
@@ -32,6 +33,10 @@ export interface CharacterCanvasHandle {
   readonly character: CharacterSystemAPI | null;
 }
 
+export interface CharacterCanvasProps {
+  settings: SettingsData | null;
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -42,8 +47,8 @@ export interface CharacterCanvasHandle {
  * Transparent full-viewport canvas overlay. Instantiates the CharacterController
  * on mount and exposes the CharacterSystemAPI ref.
  */
-const CharacterCanvas = forwardRef<CharacterCanvasHandle>(
-  function CharacterCanvas(_props, ref) {
+const CharacterCanvas = forwardRef<CharacterCanvasHandle, CharacterCanvasProps>(
+  function CharacterCanvas({ settings }, ref) {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const controllerRef = useRef<CharacterController | null>(null);
 
@@ -57,6 +62,31 @@ const CharacterCanvas = forwardRef<CharacterCanvasHandle>(
       }),
       [],
     );
+
+    // Sync settings/character appearance when changed
+    useEffect(() => {
+      const controller = controllerRef.current;
+      if (!controller || !settings) return;
+
+      const updateChar = async () => {
+        if (settings.selectedCharacterId) {
+          try {
+            await controller.setCharacter(settings.selectedCharacterId);
+          } catch (err) {
+            console.error("CharacterCanvas: failed to set character identity", err);
+          }
+        }
+        if (settings.characterScale) {
+          try {
+            controller.setScale(settings.characterScale);
+          } catch (err) {
+            console.error("CharacterCanvas: failed to set character scale", err);
+          }
+        }
+      };
+
+      updateChar();
+    }, [settings]);
 
     useEffect(() => {
       const canvas = canvasRef.current;
@@ -108,16 +138,11 @@ const CharacterCanvas = forwardRef<CharacterCanvasHandle>(
           position: "fixed",
           top: 0,
           left: 0,
-          width: "100%",
-          height: "100%",
-          // Prevent the canvas from blocking any UI interaction underneath.
-          pointerEvents: "none",
-          // Ensure block display.
-          display: "block",
-          // Render above all application UI layers.
-          zIndex: 9999,
+          width: "100vw",
+          height: "100vh",
+          zIndex: 9990, // Keeps character layer below interactive UI card (9999).
+          pointerEvents: "none", // Allows clicks to pass through to underlying windows.
         }}
-        aria-hidden="true"
       />
     );
   },

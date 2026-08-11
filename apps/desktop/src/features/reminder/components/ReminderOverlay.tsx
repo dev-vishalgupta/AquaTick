@@ -24,6 +24,7 @@ export const ReminderOverlay: React.FC<ReminderOverlayProps> = ({ isOpen, isMoun
         justifyContent: "center",
         alignItems: "center",
         zIndex: 9999,
+        pointerEvents: "none",
       }}
     >
       {children}

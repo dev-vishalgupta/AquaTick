@@ -262,27 +262,87 @@ impl SchedulerService {
         log::info!("Scheduler: Resumed. Firing in {:?}.", remaining);
     }
 
-    /// Reset to the full interval using the stored callback.
-    pub async fn reset(&self) {
-        let (interval, callback) = {
-            match self.inner.lock() {
-                Ok(g)  => (g.interval, g.on_reminder_due.clone()),
-                Err(e) => { log::error!("Scheduler: lock failed in reset(): {}", e); return; }
-            }
-        };
+    /// Reports a session resolution outcome to the scheduler.
+    /// The scheduler independently determines the future timing based on this outcome.
+    pub async fn report_resolution(
+        &self,
+        outcome: &crate::models::SessionStatus,
+        snooze_delay_minutes: Option<i64>,
+        pool: &sqlx::Pool<sqlx::Sqlite>,
+    ) {
+        log::info!("Scheduler: Received resolution report: {}.", outcome);
 
-        if interval == Duration::ZERO {
-            log::warn!("Scheduler: reset() with zero interval - staying Stopped.");
-            return;
-        }
-        let callback = match callback {
-            Some(cb) => cb,
-            None => { log::warn!("Scheduler: reset() - no callback stored."); return; }
-        };
-
+        // Stop the current timer task.
         self.stop().await;
-        self.start(interval, callback).await;
-        log::info!("Scheduler: Reset - restarted from full interval {:?}.", interval);
+
+        // If the status is final/resolved, check settings and reschedule if enabled
+        match outcome {
+            crate::models::SessionStatus::Completed
+            | crate::models::SessionStatus::TimedOut
+            | crate::models::SessionStatus::Ignored => {
+                // Fetch the latest settings
+                let settings = match crate::services::SettingsService::load_all(pool).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Scheduler: Failed to load settings for rescheduling: {}", e);
+                        return;
+                    }
+                };
+
+                if settings.reminder_enabled {
+                    let interval = Duration::from_secs(
+                        (settings.reminder_interval_minutes as u64).saturating_mul(60)
+                    );
+                    
+                    // Retrieve callback
+                    let callback = {
+                        let guard = match self.inner.lock() {
+                            Ok(g) => g,
+                            Err(e) => {
+                                log::error!("Scheduler: Lock failed retrieving callback: {}", e);
+                                return;
+                            }
+                        };
+                        guard.on_reminder_due.clone()
+                    };
+
+                    if let Some(cb) = callback {
+                        self.start(interval, cb).await;
+                        log::info!("Scheduler: Rescheduled next reminder in {} minutes.", settings.reminder_interval_minutes);
+                    } else {
+                        log::warn!("Scheduler: No callback registered, cannot start timer.");
+                    }
+                } else {
+                    log::info!("Scheduler: Reminders are disabled; not rescheduling.");
+                }
+            }
+            crate::models::SessionStatus::Snoozed => {
+                // Determine snooze delay (snooze_delay_minutes or settings default)
+                let delay = snooze_delay_minutes.unwrap_or(crate::constants::DEFAULT_SNOOZE_DURATION_MINUTES);
+                let duration = Duration::from_secs((delay as u64).saturating_mul(60));
+
+                let callback = {
+                    let guard = match self.inner.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            log::error!("Scheduler: Lock failed retrieving callback: {}", e);
+                            return;
+                        }
+                    };
+                    guard.on_reminder_due.clone()
+                };
+
+                if let Some(cb) = callback {
+                    self.start(duration, cb).await;
+                    log::info!("Scheduler: Snoozed reminder scheduled for {} minutes.", delay);
+                } else {
+                    log::warn!("Scheduler: No callback registered, cannot start snooze timer.");
+                }
+            }
+            _ => {
+                log::warn!("Scheduler: Received non-terminal or invalid status: {:?}.", outcome);
+            }
+        }
     }
 
     // -- Private ---------------------------------------------------------------

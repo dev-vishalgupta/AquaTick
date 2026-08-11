@@ -5,7 +5,9 @@
 pub mod setting;
 pub mod session;
 pub mod statistics;
+pub mod dashboard;
 
 pub use setting::{AppSettings, SettingRow, SettingValueType};
 pub use session::{HydrationSession, NewSession, SessionStatus};
 pub use statistics::{DailyStatistic, WeeklyStatistic};
+pub use dashboard::{DashboardRange, DashboardSummaryDTO, ChartDataPointDTO, StreakDataDTO, HeatmapDayDTO, DashboardResponseDTO};

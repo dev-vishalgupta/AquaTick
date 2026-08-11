@@ -97,6 +97,56 @@ const MIGRATION_V2: &[&str] = &[
     "UPDATE hydration_sessions SET character_id = 'female', updated_at = (strftime('%s','now')*1000) WHERE character_id = 'female_default'",
 ];
 
+/// Migration V3 seeds daily_goal_ml, character.scale, and app.start_on_boot settings.
+/// Uses INSERT OR IGNORE only to ensure idempotency.
+const MIGRATION_V3: &[&str] = &[
+    r#"INSERT OR IGNORE INTO settings (key, value, value_type, updated_at) VALUES ('daily_goal_ml', '2000', 'integer', (strftime('%s','now')*1000))"#,
+    r#"INSERT OR IGNORE INTO settings (key, value, value_type, updated_at) VALUES ('character.scale', 'medium', 'string', (strftime('%s','now')*1000))"#,
+    r#"INSERT OR IGNORE INTO settings (key, value, value_type, updated_at) VALUES ('app.start_on_boot', 'true', 'boolean', (strftime('%s','now')*1000))"#,
+];
+
+/// Migration V4 seeds target_mode and manual_target_reminders settings.
+/// Uses INSERT OR IGNORE only to ensure idempotency.
+const MIGRATION_V4: &[&str] = &[
+    r#"INSERT OR IGNORE INTO settings (key, value, value_type, updated_at) VALUES ('target_mode', 'automatic', 'string', (strftime('%s','now')*1000))"#,
+    r#"INSERT OR IGNORE INTO settings (key, value, value_type, updated_at) VALUES ('manual_target_reminders', '8', 'integer', (strftime('%s','now')*1000))"#,
+];
+
+const MIGRATION_V5: &[&str] = &[
+    r#"ALTER TABLE daily_statistics ADD COLUMN working_time_ms INTEGER NOT NULL DEFAULT 0"#,
+];
+
+const MIGRATION_V6: &[&str] = &[
+    // Recreate hydration_sessions to include 'ignored' in the CHECK constraint on status
+    r#"CREATE TABLE IF NOT EXISTS hydration_sessions_v6 (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        scheduled_at     INTEGER NOT NULL,
+        triggered_at     INTEGER,
+        responded_at     INTEGER,
+        status           TEXT    NOT NULL DEFAULT 'pending'
+                         CHECK(status IN ('pending','triggered','completed','snoozed','timed_out','ignored')),
+        snooze_count     INTEGER NOT NULL DEFAULT 0,
+        interval_minutes INTEGER NOT NULL,
+        character_id     TEXT    NOT NULL,
+        sound_id         TEXT,
+        created_at       INTEGER NOT NULL,
+        updated_at       INTEGER NOT NULL
+    )"#,
+    r#"INSERT INTO hydration_sessions_v6 (id, scheduled_at, triggered_at, responded_at, status, snooze_count, interval_minutes, character_id, sound_id, created_at, updated_at)
+       SELECT id, scheduled_at, triggered_at, responded_at, status, snooze_count, interval_minutes, character_id, sound_id, created_at, updated_at FROM hydration_sessions"#,
+    r#"DROP TABLE hydration_sessions"#,
+    r#"ALTER TABLE hydration_sessions_v6 RENAME TO hydration_sessions"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_hydration_sessions_scheduled_at ON hydration_sessions(scheduled_at)"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_hydration_sessions_status ON hydration_sessions(status)"#,
+
+    // Add ignored_count column to daily_statistics
+    r#"ALTER TABLE daily_statistics ADD COLUMN ignored_count INTEGER NOT NULL DEFAULT 0"#,
+];
+
+const MIGRATION_V7: &[&str] = &[
+    r#"DELETE FROM settings WHERE key = 'daily_goal_ml'"#,
+];
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -107,6 +157,31 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         description: "Migrate default character ID from female_default to female",
         statements: MIGRATION_V2,
+    },
+    Migration {
+        version: 3,
+        description: "Seed daily_goal_ml, character.scale, and app.start_on_boot default settings",
+        statements: MIGRATION_V3,
+    },
+    Migration {
+        version: 4,
+        description: "Seed target_mode and manual_target_reminders default settings",
+        statements: MIGRATION_V4,
+    },
+    Migration {
+        version: 5,
+        description: "Add working_time_ms column to daily_statistics",
+        statements: MIGRATION_V5,
+    },
+    Migration {
+        version: 6,
+        description: "Add ignored status and ignored_count to daily_statistics",
+        statements: MIGRATION_V6,
+    },
+    Migration {
+        version: 7,
+        description: "Remove obsolete daily_goal_ml setting",
+        statements: MIGRATION_V7,
     },
 ];
 
@@ -144,7 +219,7 @@ async fn current_schema_version(pool: &Pool<Sqlite>) -> AppResult<i64> {
     }
 }
 
-/// Seeds the seven default rows into the `settings` table.
+/// Seeds the default rows into the `settings` table.
 /// Uses `INSERT OR IGNORE` — existing rows are never overwritten.
 async fn seed_defaults(pool: &Pool<Sqlite>, now_ms: i64) -> AppResult<()> {
     use constants::*;
@@ -157,6 +232,10 @@ async fn seed_defaults(pool: &Pool<Sqlite>, now_ms: i64) -> AppResult<()> {
         (setting_keys::REMINDER_SOUND_ENABLED,  "true",                 "boolean"),
         (setting_keys::REMINDER_SOUND_VOLUME,   &DEFAULT_SOUND_VOLUME.to_string(), "real"),
         (setting_keys::CHARACTER_ID,            DEFAULT_CHARACTER_ID,   "string"),
+        (setting_keys::CHARACTER_SCALE,         DEFAULT_CHARACTER_SCALE, "string"),
+        (setting_keys::START_ON_BOOT,          &DEFAULT_START_ON_BOOT.to_string(), "boolean"),
+        (setting_keys::TARGET_MODE,             DEFAULT_TARGET_MODE,    "string"),
+        (setting_keys::MANUAL_TARGET_REMINDERS, &DEFAULT_MANUAL_TARGET_REMINDERS.to_string(), "integer"),
     ];
 
     for (key, value, value_type) in defaults {

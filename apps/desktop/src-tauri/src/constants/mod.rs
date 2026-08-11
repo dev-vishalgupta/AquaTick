@@ -10,6 +10,12 @@
 /// Interval between Hydration Sessions (minutes).
 pub const DEFAULT_REMINDER_INTERVAL_MINUTES: i64 = 60;
 
+/// Default target mode ("automatic" or "manual").
+pub const DEFAULT_TARGET_MODE: &str = "automatic";
+
+/// Default manual target reminders.
+pub const DEFAULT_MANUAL_TARGET_REMINDERS: i64 = 8;
+
 /// Duration of a single snooze (minutes).
 pub const DEFAULT_SNOOZE_DURATION_MINUTES: i64 = 5;
 
@@ -35,6 +41,9 @@ pub const DEFAULT_SOUND_ENABLED: bool = true;
 /// Default character manifest ID.
 pub const DEFAULT_CHARACTER_ID: &str = "female";
 
+/// Default character visual scale.
+pub const DEFAULT_CHARACTER_SCALE: &str = "medium";
+
 // ── Window ────────────────────────────────────────────────────────────────────
 
 /// Initial window width on first launch (px).
@@ -55,7 +64,9 @@ pub const DEFAULT_MIN_WINDOW_HEIGHT: u32 = 600;
 pub const DEFAULT_DATABASE_NAME: &str = "aquatick.sqlite";
 
 /// Whether to register with OS autostart on first launch.
-pub const DEFAULT_START_ON_BOOT: bool = true;
+/// Defaults to false — AquaTick requires explicit user opt-in before
+/// registering itself with the Windows Startup list.
+pub const DEFAULT_START_ON_BOOT: bool = false;
 
 /// Semantic version of the application.
 pub const APP_VERSION: &str = "0.1.0";
@@ -63,7 +74,7 @@ pub const APP_VERSION: &str = "0.1.0";
 // ── Database ──────────────────────────────────────────────────────────────────
 
 /// Current schema version. Increment when adding a new migration.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 7;
 
 // ── Active Usage ──────────────────────────────────────────────────────────────
 
@@ -89,6 +100,10 @@ pub mod setting_keys {
     pub const REMINDER_SOUND_ENABLED: &str = "reminder.sound_enabled";
     pub const REMINDER_SOUND_VOLUME: &str = "reminder.sound_volume";
     pub const CHARACTER_ID: &str = "character.id";
+    pub const CHARACTER_SCALE: &str = "character.scale";
+    pub const START_ON_BOOT: &str = "app.start_on_boot";
+    pub const TARGET_MODE: &str = "target_mode";
+    pub const MANUAL_TARGET_REMINDERS: &str = "manual_target_reminders";
 }
 
 /// All valid setting keys. Used by SettingsService for validation.
@@ -101,4 +116,8 @@ pub const VALID_SETTING_KEYS: &[&str] = &[
     setting_keys::REMINDER_SOUND_ENABLED,
     setting_keys::REMINDER_SOUND_VOLUME,
     setting_keys::CHARACTER_ID,
+    setting_keys::CHARACTER_SCALE,
+    setting_keys::START_ON_BOOT,
+    setting_keys::TARGET_MODE,
+    setting_keys::MANUAL_TARGET_REMINDERS,
 ];

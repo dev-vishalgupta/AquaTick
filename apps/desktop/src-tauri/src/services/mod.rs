@@ -10,6 +10,8 @@ pub mod scheduler_service;
 pub mod session_service;
 pub mod settings_service;
 pub mod statistics_service;
+pub mod lifecycle_service;
+pub mod autostart_service;
 
 pub use activity_monitor_service::{ActivityMonitorService, MonitorState};
 pub use reminder_engine_service::{
@@ -19,4 +21,5 @@ pub use scheduler_service::{OnReminderDue, SchedulerService, SchedulerState};
 pub use session_service::SessionService;
 pub use settings_service::SettingsService;
 pub use statistics_service::StatisticsService;
-
+pub use lifecycle_service::LifecycleService;
+pub use autostart_service::AutostartService;

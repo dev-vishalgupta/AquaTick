@@ -1,17 +1,18 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
-import Dashboard from "./pages/Dashboard";
+import StatisticsPage from "./pages/Statistics";
 import Settings from "./pages/Settings";
 import About from "./pages/About";
-import SystemOrchestrator from "./components/SystemOrchestrator";
+import AppShell from "./components/AppShell";
 
 export default function App() {
   return (
     <BrowserRouter>
-      <SystemOrchestrator />
       <Routes>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/settings" element={<Settings />} />
-        <Route path="/about" element={<About />} />
+        <Route element={<AppShell />}>
+          <Route path="/" element={<StatisticsPage />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="/about" element={<About />} />
+        </Route>
       </Routes>
     </BrowserRouter>
   );

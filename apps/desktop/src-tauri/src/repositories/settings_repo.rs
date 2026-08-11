@@ -2,7 +2,7 @@
 //!
 //! Provides pure CRUD operations with no business logic or caching.
 
-use sqlx::{Pool, Sqlite};
+use sqlx::SqliteConnection;
 
 use crate::errors::AppResult;
 use crate::models::SettingRow;
@@ -12,23 +12,23 @@ pub struct SettingsRepository;
 
 impl SettingsRepository {
     /// Fetches all rows from the `settings` table.
-    pub async fn get_all(pool: &Pool<Sqlite>) -> AppResult<Vec<SettingRow>> {
+    pub async fn get_all(conn: &mut SqliteConnection) -> AppResult<Vec<SettingRow>> {
         let rows = sqlx::query_as::<_, SettingRow>(
             "SELECT key, value, value_type, updated_at FROM settings"
         )
-        .fetch_all(pool)
+        .fetch_all(conn)
         .await?;
 
         Ok(rows)
     }
 
     /// Fetches a single setting row by its unique key.
-    pub async fn get_by_key(pool: &Pool<Sqlite>, key: &str) -> AppResult<Option<SettingRow>> {
+    pub async fn get_by_key(conn: &mut SqliteConnection, key: &str) -> AppResult<Option<SettingRow>> {
         let row = sqlx::query_as::<_, SettingRow>(
             "SELECT key, value, value_type, updated_at FROM settings WHERE key = ?"
         )
         .bind(key)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await?;
 
         Ok(row)
@@ -36,7 +36,7 @@ impl SettingsRepository {
 
     /// Inserts a new setting key-value pair or updates the value/updated_at if the key already exists.
     pub async fn upsert(
-        pool: &Pool<Sqlite>,
+        conn: &mut SqliteConnection,
         key: &str,
         value: &str,
         value_type: &str,
@@ -53,17 +53,17 @@ impl SettingsRepository {
         .bind(value)
         .bind(value_type)
         .bind(updated_at)
-        .execute(pool)
+        .execute(conn)
         .await?;
 
         Ok(())
     }
 
     /// Deletes a setting row by its unique key.
-    pub async fn delete_by_key(pool: &Pool<Sqlite>, key: &str) -> AppResult<()> {
+    pub async fn delete_by_key(conn: &mut SqliteConnection, key: &str) -> AppResult<()> {
         sqlx::query("DELETE FROM settings WHERE key = ?")
             .bind(key)
-            .execute(pool)
+            .execute(conn)
             .await?;
 
         Ok(())

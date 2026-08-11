@@ -13,6 +13,10 @@ import type {
   SessionTimedOutPayload,
   SettingsChangedPayload,
   CharacterChangedPayload,
+  ReminderPresentedPayload,
+  PresentationReadyPayload,
+  ReminderDismissedPayload,
+  PresentationClosedPayload,
 } from "./types";
 
 export function validateSessionTriggered(data: any): SessionTriggeredPayload {
@@ -71,6 +75,47 @@ export function validateSessionTimedOut(data: any): SessionTimedOutPayload {
   };
 }
 
+export function validateReminderPresented(data: any): ReminderPresentedPayload {
+  if (!data || typeof data !== "object") {
+    throw new Error("Payload must be an object");
+  }
+  if (typeof data.sessionId !== "string") {
+    throw new Error("sessionId must be a string");
+  }
+  return {
+    sessionId: data.sessionId,
+  };
+}
+
+export function validatePresentationReady(data: any): PresentationReadyPayload {
+  if (!data || typeof data !== "object") {
+    throw new Error("Payload must be an object");
+  }
+  if (typeof data.componentId !== "string") {
+    throw new Error("componentId must be a string");
+  }
+  return {
+    componentId: data.componentId,
+  };
+}
+
+export function validateReminderDismissed(_data: any): ReminderDismissedPayload {
+  return {};
+}
+
+export function validatePresentationClosed(data: any): PresentationClosedPayload {
+  if (!data || typeof data !== "object") {
+    throw new Error("Payload must be an object");
+  }
+  if (typeof data.componentId !== "string") {
+    throw new Error("componentId must be a string");
+  }
+  return {
+    componentId: data.componentId,
+    reason: typeof data.reason === "string" ? data.reason : undefined,
+  };
+}
+
 export function validateSettingsChanged(data: any): SettingsChangedPayload {
   if (!data || typeof data !== "object") {
     throw new Error("Payload must be an object");
@@ -78,6 +123,7 @@ export function validateSettingsChanged(data: any): SettingsChangedPayload {
   if (!data.settings || typeof data.settings !== "object") {
     throw new Error("settings field must be an object");
   }
+  
   return {
     settings: data.settings,
   };

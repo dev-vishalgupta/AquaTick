@@ -30,63 +30,77 @@ impl SessionService {
             created_at: now_ms,
         };
 
-        let id = SessionRepository::insert(pool, &new_session).await?;
+        let mut conn = pool.acquire().await?;
+        let id = SessionRepository::insert(&mut conn, &new_session).await?;
         let session = Self::get_by_id(pool, id).await?;
         Ok(session)
     }
 
     /// Fetches a hydration session by its unique ID.
     pub async fn get_by_id(pool: &Pool<Sqlite>, id: i64) -> AppResult<HydrationSession> {
-        SessionRepository::get_by_id(pool, id)
+        let mut conn = pool.acquire().await?;
+        SessionRepository::get_by_id(&mut conn, id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Hydration session ID {} not found", id)))
     }
 
     /// Transitions a session's status to 'triggered' and logs the triggered_at timestamp.
     pub async fn mark_triggered(pool: &Pool<Sqlite>, id: i64) -> AppResult<()> {
-        let session = Self::get_by_id(pool, id).await?;
+        let mut conn = pool.acquire().await?;
+        let session = SessionRepository::get_by_id(&mut conn, id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Hydration session ID {} not found", id)))?;
         let current_status = SessionStatus::from_str(&session.status)?;
         let target_status = SessionStatus::Triggered;
 
         Self::validate_transition(&current_status, &target_status)?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
-        SessionRepository::update_triggered(pool, id, target_status, now_ms, now_ms).await?;
+        SessionRepository::update_triggered(&mut conn, id, target_status, now_ms, now_ms).await?;
 
         Ok(())
     }
 
     /// Transitions a session to 'completed' status.
     pub async fn complete(pool: &Pool<Sqlite>, id: i64) -> AppResult<()> {
-        let session = Self::get_by_id(pool, id).await?;
+        let mut conn = pool.acquire().await?;
+        let session = SessionRepository::get_by_id(&mut conn, id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Hydration session ID {} not found", id)))?;
         let current_status = SessionStatus::from_str(&session.status)?;
         let target_status = SessionStatus::Completed;
 
         Self::validate_transition(&current_status, &target_status)?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
-        SessionRepository::update_status(pool, id, target_status, Some(now_ms), now_ms).await?;
+        SessionRepository::update_status(&mut conn, id, target_status, Some(now_ms), now_ms).await?;
 
         Ok(())
     }
 
     /// Transitions a session to 'timed_out' status.
     pub async fn mark_timed_out(pool: &Pool<Sqlite>, id: i64) -> AppResult<()> {
-        let session = Self::get_by_id(pool, id).await?;
+        let mut conn = pool.acquire().await?;
+        let session = SessionRepository::get_by_id(&mut conn, id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Hydration session ID {} not found", id)))?;
         let current_status = SessionStatus::from_str(&session.status)?;
         let target_status = SessionStatus::TimedOut;
 
         Self::validate_transition(&current_status, &target_status)?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
-        SessionRepository::update_status(pool, id, target_status, Some(now_ms), now_ms).await?;
+        SessionRepository::update_status(&mut conn, id, target_status, Some(now_ms), now_ms).await?;
 
         Ok(())
     }
 
     /// Transitions a session to 'snoozed' status and increments the snooze count.
     pub async fn snooze(pool: &Pool<Sqlite>, id: i64) -> AppResult<()> {
-        let session = Self::get_by_id(pool, id).await?;
+        let mut conn = pool.acquire().await?;
+        let session = SessionRepository::get_by_id(&mut conn, id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Hydration session ID {} not found", id)))?;
         let current_status = SessionStatus::from_str(&session.status)?;
         let target_status = SessionStatus::Snoozed;
 
@@ -94,8 +108,8 @@ impl SessionService {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         // Update status to 'snoozed' (responded_at is NULL during snooze)
-        SessionRepository::update_status(pool, id, target_status, None, now_ms).await?;
-        SessionRepository::increment_snooze(pool, id, now_ms).await?;
+        SessionRepository::update_status(&mut conn, id, target_status, None, now_ms).await?;
+        SessionRepository::increment_snooze(&mut conn, id, now_ms).await?;
 
         Ok(())
     }
@@ -107,16 +121,17 @@ impl SessionService {
         current_time_ms: i64,
         timeout_minutes: i64,
     ) -> AppResult<u32> {
+        let mut conn = pool.acquire().await?;
         let timeout_ms = timeout_minutes * 60 * 1000;
         let cutoff_time = current_time_ms - timeout_ms;
 
-        let stale_sessions = SessionRepository::get_triggered_before(pool, cutoff_time).await?;
+        let stale_sessions = SessionRepository::get_triggered_before(&mut conn, cutoff_time).await?;
         let count = stale_sessions.len() as u32;
 
         for session in stale_sessions {
             // Force transition to timed_out (bypassing normal validation because it is recovery)
             SessionRepository::update_status(
-                pool,
+                &mut conn,
                 session.id,
                 SessionStatus::TimedOut,
                 Some(current_time_ms),
@@ -136,7 +151,7 @@ impl SessionService {
     /// - `pending` -> `triggered`
     /// - `triggered` -> `completed`, `timed_out`, `snoozed`
     /// - `snoozed` -> `triggered`
-    fn validate_transition(current: &SessionStatus, target: &SessionStatus) -> AppResult<()> {
+    pub fn validate_transition(current: &SessionStatus, target: &SessionStatus) -> AppResult<()> {
         if current.is_final() {
             return Err(AppError::Validation(format!(
                 "Cannot transition from final status '{}' for session",
@@ -148,7 +163,7 @@ impl SessionService {
             SessionStatus::Pending => matches!(target, SessionStatus::Triggered),
             SessionStatus::Triggered => matches!(
                 target,
-                SessionStatus::Completed | SessionStatus::TimedOut | SessionStatus::Snoozed
+                SessionStatus::Completed | SessionStatus::TimedOut | SessionStatus::Snoozed | SessionStatus::Ignored
             ),
             SessionStatus::Snoozed => matches!(target, SessionStatus::Triggered),
             _ => false,

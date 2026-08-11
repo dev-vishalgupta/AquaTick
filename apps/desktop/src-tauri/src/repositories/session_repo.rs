@@ -2,7 +2,7 @@
 //!
 //! Provides pure CRUD operations with no business rules, scheduling, or timer logic.
 
-use sqlx::{Pool, Sqlite};
+use sqlx::SqliteConnection;
 
 use crate::errors::AppResult;
 use crate::models::{HydrationSession, NewSession, SessionStatus};
@@ -13,7 +13,7 @@ pub struct SessionRepository;
 impl SessionRepository {
     /// Inserts a new hydration session in 'pending' status.
     /// Returns the database-generated auto-incremented ID.
-    pub async fn insert(pool: &Pool<Sqlite>, session: &NewSession) -> AppResult<i64> {
+    pub async fn insert(conn: &mut SqliteConnection, session: &NewSession) -> AppResult<i64> {
         let result = sqlx::query(
             "INSERT INTO hydration_sessions ( \
                 scheduled_at, triggered_at, responded_at, status, snooze_count, \
@@ -26,21 +26,21 @@ impl SessionRepository {
         .bind(&session.sound_id)
         .bind(session.created_at)
         .bind(session.created_at) // updated_at is initially created_at
-        .execute(pool)
+        .execute(conn)
         .await?;
 
         Ok(result.last_insert_rowid())
     }
 
     /// Fetches a hydration session by its ID.
-    pub async fn get_by_id(pool: &Pool<Sqlite>, id: i64) -> AppResult<Option<HydrationSession>> {
+    pub async fn get_by_id(conn: &mut SqliteConnection, id: i64) -> AppResult<Option<HydrationSession>> {
         let row = sqlx::query_as::<_, HydrationSession>(
             "SELECT id, scheduled_at, triggered_at, responded_at, status, snooze_count, \
                     interval_minutes, character_id, sound_id, created_at, updated_at \
              FROM hydration_sessions WHERE id = ?"
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await?;
 
         Ok(row)
@@ -48,7 +48,7 @@ impl SessionRepository {
 
     /// Updates the status, responded_at, and updated_at of a session.
     pub async fn update_status(
-        pool: &Pool<Sqlite>,
+        conn: &mut SqliteConnection,
         id: i64,
         status: SessionStatus,
         responded_at: Option<i64>,
@@ -63,7 +63,7 @@ impl SessionRepository {
         .bind(responded_at)
         .bind(updated_at)
         .bind(id)
-        .execute(pool)
+        .execute(conn)
         .await?;
 
         Ok(())
@@ -71,7 +71,7 @@ impl SessionRepository {
 
     /// Updates the status, triggered_at, and updated_at of a session.
     pub async fn update_triggered(
-        pool: &Pool<Sqlite>,
+        conn: &mut SqliteConnection,
         id: i64,
         status: SessionStatus,
         triggered_at: i64,
@@ -86,7 +86,7 @@ impl SessionRepository {
         .bind(triggered_at)
         .bind(updated_at)
         .bind(id)
-        .execute(pool)
+        .execute(conn)
         .await?;
 
         Ok(())
@@ -94,7 +94,7 @@ impl SessionRepository {
 
     /// Increments the snooze count and updates updated_at for a session.
     pub async fn increment_snooze(
-        pool: &Pool<Sqlite>,
+        conn: &mut SqliteConnection,
         id: i64,
         updated_at: i64,
     ) -> AppResult<()> {
@@ -105,7 +105,7 @@ impl SessionRepository {
         )
         .bind(updated_at)
         .bind(id)
-        .execute(pool)
+        .execute(conn)
         .await?;
 
         Ok(())
@@ -114,7 +114,7 @@ impl SessionRepository {
     /// Finds sessions that were left in the 'triggered' state before a specific timestamp.
     /// This is used for crash recovery when the application starts up.
     pub async fn get_triggered_before(
-        pool: &Pool<Sqlite>,
+        conn: &mut SqliteConnection,
         timestamp_ms: i64,
     ) -> AppResult<Vec<HydrationSession>> {
         let rows = sqlx::query_as::<_, HydrationSession>(
@@ -124,14 +124,14 @@ impl SessionRepository {
              WHERE status = 'triggered' AND triggered_at < ?"
         )
         .bind(timestamp_ms)
-        .fetch_all(pool)
+        .fetch_all(conn)
         .await?;
 
         Ok(rows)
     }
 
     /// Fetches all sessions scheduled on a specific calendar date (ISO format YYYY-MM-DD).
-    pub async fn get_by_date(pool: &Pool<Sqlite>, date: &str) -> AppResult<Vec<HydrationSession>> {
+    pub async fn get_by_date(conn: &mut SqliteConnection, date: &str) -> AppResult<Vec<HydrationSession>> {
         let rows = sqlx::query_as::<_, HydrationSession>(
             "SELECT id, scheduled_at, triggered_at, responded_at, status, snooze_count, \
                     interval_minutes, character_id, sound_id, created_at, updated_at \
@@ -139,7 +139,7 @@ impl SessionRepository {
              WHERE date(scheduled_at / 1000, 'unixepoch') = ?"
         )
         .bind(date)
-        .fetch_all(pool)
+        .fetch_all(conn)
         .await?;
 
         Ok(rows)

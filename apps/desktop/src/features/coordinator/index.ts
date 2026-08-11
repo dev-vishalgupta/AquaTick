@@ -15,6 +15,10 @@ export type {
   SessionTimedOutPayload,
   SettingsChangedPayload,
   CharacterChangedPayload,
+  ReminderPresentedPayload,
+  PresentationReadyPayload,
+  ReminderDismissedPayload,
+  PresentationClosedPayload,
   AppSettings,
   UnsubscribeFn,
 } from "./types";
@@ -25,4 +29,8 @@ export {
   validateSessionTimedOut,
   validateSettingsChanged,
   validateCharacterChanged,
+  validateReminderPresented,
+  validatePresentationReady,
+  validateReminderDismissed,
+  validatePresentationClosed,
 } from "./validators";

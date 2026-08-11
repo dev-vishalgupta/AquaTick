@@ -172,6 +172,10 @@ export class CharacterController implements CharacterSystemAPI {
 
     this.stateMachine.transitionTo(targetState, { playOptions: options });
 
+    if (!this.animationController.isPlaying()) {
+      return Promise.resolve();
+    }
+
     const isLooping = options?.loop ?? this.animationController.getDefinition()?.loop ?? false;
     if (isLooping) {
       return Promise.resolve();

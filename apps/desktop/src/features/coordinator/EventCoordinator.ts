@@ -5,7 +5,7 @@
  * Coordinates validation and delivery of strongly typed payloads to frontend features.
  */
 
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import type { EventType, EventPayload, EventHandler, UnsubscribeFn } from "./types";
 import {
   validateSessionTriggered,
@@ -14,7 +14,12 @@ import {
   validateSessionTimedOut,
   validateSettingsChanged,
   validateCharacterChanged,
+  validateReminderPresented,
+  validatePresentationReady,
+  validateReminderDismissed,
+  validatePresentationClosed,
 } from "./validators";
+import { mapBackendSettingsToFrontendSettings } from "../settings/api/mappers";
 
 class EventCoordinatorClass {
   private handlers: { [K in EventType]?: Set<EventHandler<K>> } = {};
@@ -82,7 +87,15 @@ class EventCoordinatorClass {
       this.tauriUnlisteners.push(unlistenTimedOut);
 
       const unlistenSettings = await listen<any>("settings:changed", (event) => {
-        this.dispatch("settings:changed", event.payload, validateSettingsChanged);
+        const rawPayload = event.payload;
+        let mappedPayload = rawPayload;
+        if (rawPayload && typeof rawPayload === "object" && rawPayload.settings) {
+          mappedPayload = {
+            ...rawPayload,
+            settings: mapBackendSettingsToFrontendSettings(rawPayload.settings),
+          };
+        }
+        this.dispatch("settings:changed", mappedPayload, validateSettingsChanged);
       });
       this.tauriUnlisteners.push(unlistenSettings);
 
@@ -90,6 +103,26 @@ class EventCoordinatorClass {
         this.dispatch("character:changed", event.payload, validateCharacterChanged);
       });
       this.tauriUnlisteners.push(unlistenCharacter);
+
+      const unlistenReminderPresented = await listen<any>("reminder:presented", (event) => {
+        this.dispatch("reminder:presented", event.payload, validateReminderPresented);
+      });
+      this.tauriUnlisteners.push(unlistenReminderPresented);
+
+      const unlistenPresentationReady = await listen<any>("presentation:ready", (event) => {
+        this.dispatch("presentation:ready", event.payload, validatePresentationReady);
+      });
+      this.tauriUnlisteners.push(unlistenPresentationReady);
+
+      const unlistenReminderDismissed = await listen<any>("reminder:dismissed", (event) => {
+        this.dispatch("reminder:dismissed", event.payload, validateReminderDismissed);
+      });
+      this.tauriUnlisteners.push(unlistenReminderDismissed);
+
+      const unlistenPresentationClosed = await listen<any>("presentation:closed", (event) => {
+        this.dispatch("presentation:closed", event.payload, validatePresentationClosed);
+      });
+      this.tauriUnlisteners.push(unlistenPresentationClosed);
 
       this.isInitialized = true;
     } catch (err) {
@@ -153,6 +186,17 @@ class EventCoordinatorClass {
           console.error(`EventCoordinator: Exception thrown in mock handler for event "${event}".`, handlerErr);
         }
       }
+    }
+  }
+
+  /**
+   * Helper to emit Tauri events back to the backend.
+   */
+  async emit<T extends EventType>(event: T, payload: EventPayload<T>): Promise<void> {
+    try {
+      await emit(event, payload);
+    } catch (err) {
+      console.error(`EventCoordinator: Failed to emit event "${event}".`, err);
     }
   }
 }
