@@ -30,20 +30,10 @@
 //! # Engine State Machine
 //!
 //! ```text
-//!   +------+  handle_reminder_due  +---------------+
-//!   ¦ Idle ¦ -------------------? ¦ SessionActive ¦
-//!   +------+                       +---------------+
-//!                                          ¦ complete_session()
-//!                                          ¦   ? Completed  ? Idle (scheduler reset)
-//!                                          ¦ timeout_session()
-//!                                          ¦   ? TimedOut   ? Idle (scheduler reset)
-//!                                          ¦ snooze_session()
-//!                                          ¦   ? Snoozed
-//!                                          ?
-//!                                    +---------+
-//!                                    ¦ Snoozed ¦
-//!                                    +---------+
-//!                                         ¦ snooze timer fires ? SessionActive (re-triggered)
+//!   Idle -> SessionActive -> Resolving -> Idle (terminal outcome)
+//!                              |          -> Snoozed (snooze outcome)
+//!                              +-> SessionActive on recoverable persistence failure
+//!   Snoozed -> SessionActive when the snooze timer re-triggers the same session
 //! ```
 //!
 //! # Thread Safety
@@ -98,7 +88,7 @@ struct InnerEngineState {
 
     /// The currently active session ID.
     ///
-    /// `Some(id)` in `SessionActive` and `Snoozed` states.
+    /// `Some(id)` in `SessionActive`, `Resolving`, and `Snoozed` states.
     /// `None` in `Idle`.
     ///
     /// Invariant S-1: only one active session may exist.
@@ -379,6 +369,7 @@ impl ReminderEngineService {
         let engine = self.clone();
         let pool = pool.clone();
         let scheduler = scheduler.clone();
+        let previous_state_for_worker = previous_state.clone();
         let worker = tokio::spawn(async move {
             if let Some(handle) = timeout_handle {
                 handle.abort();
@@ -397,7 +388,7 @@ impl ReminderEngineService {
                 engine.restore_after_resolution_failure(
                     pool.clone(),
                     active_id,
-                    previous_state,
+                    previous_state_for_worker,
                     scheduler.clone(),
                 );
             }
@@ -405,11 +396,20 @@ impl ReminderEngineService {
             result
         });
 
-        worker.await.map_err(|error| {
-            crate::errors::AppError::Internal(format!(
-                "Reminder Engine resolution task failed: {}", error
-            ))
-        })?
+        match worker.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.restore_after_resolution_failure(
+                    pool.clone(),
+                    active_id,
+                    previous_state,
+                    scheduler.clone(),
+                );
+                Err(crate::errors::AppError::Internal(format!(
+                    "Reminder Engine resolution task failed: {}", error
+                )))
+            }
+        }
     }
 
     /// Performs the database transaction and post-commit handoff for an accepted resolution.
