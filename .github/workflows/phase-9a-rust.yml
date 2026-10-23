@@ -1,0 +1,22 @@
+name: Phase 9A Rust
+on:
+  pull_request:
+    paths:
+      - 'apps/desktop/src-tauri/**'
+      - '.github/workflows/phase-9a-rust.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup show
+      - name: Compile and execute Rust library tests
+        run: cargo test --locked --lib -- --nocapture
