@@ -66,13 +66,15 @@ use crate::services::{scheduler_service::OnReminderDue, SchedulerService, Sessio
 
 // -- Engine state --------------------------------------------------------------
 
-/// The three states of the Reminder Engine.
+/// The four states of the Reminder Engine.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineState {
     /// No active session. Scheduler is running toward the next reminder.
     Idle,
     /// A session is in `triggered` status. Timeout timer is running.
     SessionActive,
+    /// An outcome has been reserved and its persistence is in progress.
+    Resolving,
     /// Session is in `snoozed` status. Snooze timer is running.
     Snoozed,
 }
@@ -82,6 +84,7 @@ impl std::fmt::Display for EngineState {
         match self {
             Self::Idle          => write!(f, "Idle"),
             Self::SessionActive => write!(f, "SessionActive"),
+            Self::Resolving     => write!(f, "Resolving"),
             Self::Snoozed       => write!(f, "Snoozed"),
         }
     }
@@ -307,9 +310,11 @@ impl ReminderEngineService {
         .await
     }
 
-    /// Core orchestrator for session resolution.
-    /// Ensures atomic transaction commit and strict ordering:
-    /// Validation -> Persistence -> Statistics -> Commit -> Scheduler Handoff -> Presentation Notification -> Completed.
+    /// Reserves a session outcome before spawning independently-owned persistence work.
+    ///
+    /// The spawned task deliberately outlives this caller. In particular, the timeout
+    /// task may abort itself when the accepted resolution cancels its timer; that must
+    /// not cancel the transaction that records the timeout.
     async fn resolve_session(
         &self,
         pool: &Pool<Sqlite>,
@@ -319,112 +324,231 @@ impl ReminderEngineService {
         snooze_delay_minutes: Option<i64>,
         scheduler: &SchedulerService,
     ) -> AppResult<()> {
-        log::info!("ReminderEngine: Resolution Requested for session {} to status '{}'.", session_id, target_status);
+        if target_status == SessionStatus::Snoozed {
+            validate_snooze_delay(snooze_delay_minutes.ok_or_else(|| {
+                crate::errors::AppError::Validation("Snooze duration is required".into())
+            })?)?;
+        }
 
-        // 1. Validation (Idempotency & state protection)
-        let active_id = {
-            let guard = match self.inner.lock() {
-                Ok(g) => g,
-                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
-            };
+        let (active_id, previous_state, timeout_handle) = {
+            let mut guard = self.inner.lock().map_err(|e| {
+                crate::errors::AppError::Internal(e.to_string())
+            })?;
 
-            // Protect against duplicate button clicks / IPC events
             if guard.engine_state == EngineState::Idle {
-                log::warn!("ReminderEngine: resolve_session() called but engine is Idle — ignoring request.");
+                log::warn!("ReminderEngine: resolution requested while Idle; ignoring.");
                 return Ok(());
             }
 
-            if guard.engine_state == EngineState::Snoozed && target_status == SessionStatus::Snoozed {
-                log::warn!("ReminderEngine: resolve_session() snooze called but already Snoozed — ignoring request.");
+            if guard.engine_state == EngineState::Resolving {
+                log::warn!("ReminderEngine: a resolution is already in progress; ignoring duplicate request.");
                 return Ok(());
             }
 
-            match guard.active_session_id {
+            if guard.engine_state == EngineState::Snoozed
+                && target_status == SessionStatus::Snoozed
+            {
+                log::warn!("ReminderEngine: session is already Snoozed; ignoring duplicate snooze.");
+                return Ok(());
+            }
+
+            let active_id = match guard.active_session_id {
                 Some(id) if id == session_id => id,
                 Some(other) => {
                     log::warn!(
-                        "ReminderEngine: resolve_session() session_id {} does not match active session {} — ignoring request.",
+                        "ReminderEngine: resolution session {} does not match active session {}; ignoring.",
                         session_id, other
                     );
-                    return Ok(()); // Exactly-once resolution: ignore mismatched ID
+                    return Ok(());
                 }
                 None => {
                     return Err(crate::errors::AppError::Internal(
-                        "ReminderEngine: resolve_session() — no active session ID in non-Idle state.".into()
+                        "ReminderEngine: active session ID missing in a non-Idle state.".into()
                     ));
                 }
-            }
+            };
+
+            let previous_state = guard.engine_state.clone();
+            guard.engine_state = EngineState::Resolving;
+            // Taking the handle reserves/cancels timeout protection only after the
+            // independent worker has been created below.
+            let timeout_handle = guard.timeout_handle.take();
+            (active_id, previous_state, timeout_handle)
         };
 
-        // Cancel timeout timer immediately.
-        self.cancel_timeout_timer();
+        let engine = self.clone();
+        let pool = pool.clone();
+        let scheduler = scheduler.clone();
+        let worker = tokio::spawn(async move {
+            if let Some(handle) = timeout_handle {
+                handle.abort();
+            }
 
-        // 2. Transaction Boundary
+            let result = engine.resolve_session_operation(
+                &pool,
+                active_id,
+                target_status,
+                active_ms_today,
+                snooze_delay_minutes,
+                &scheduler,
+            ).await;
+
+            if result.is_err() {
+                engine.restore_after_resolution_failure(
+                    pool.clone(),
+                    active_id,
+                    previous_state,
+                    scheduler.clone(),
+                );
+            }
+
+            result
+        });
+
+        worker.await.map_err(|error| {
+            crate::errors::AppError::Internal(format!(
+                "Reminder Engine resolution task failed: {}", error
+            ))
+        })?
+    }
+
+    /// Performs the database transaction and post-commit handoff for an accepted resolution.
+    async fn resolve_session_operation(
+        &self,
+        pool: &Pool<Sqlite>,
+        session_id: i64,
+        target_status: SessionStatus,
+        active_ms_today: i64,
+        snooze_delay_minutes: Option<i64>,
+        scheduler: &SchedulerService,
+    ) -> AppResult<()> {
+        log::info!(
+            "ReminderEngine: Persisting resolution for session {} to '{}'.",
+            session_id, target_status
+        );
+
+        // Load settings before opening the transaction. A settings failure must not
+        // be silently replaced with defaults or leave an open transaction.
+        let terminal = target_status == SessionStatus::Completed
+            || target_status == SessionStatus::TimedOut
+            || target_status == SessionStatus::Ignored;
+        let settings = if terminal {
+            Some(crate::services::SettingsService::load_all(pool).await?)
+        } else {
+            None
+        };
+
         let mut tx = pool.begin().await?;
-
-        // 3. Persistence
-        let session = SessionRepository::get_by_id(&mut *tx, active_id)
+        let session = SessionRepository::get_by_id(&mut *tx, session_id)
             .await?
-            .ok_or_else(|| crate::errors::AppError::NotFound(format!("Session {} not found", active_id)))?;
+            .ok_or_else(|| crate::errors::AppError::NotFound(
+                format!("Session {} not found", session_id)
+            ))?;
 
         let current_status = std::str::FromStr::from_str(&session.status)?;
         SessionService::validate_transition(&current_status, &target_status)?;
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         if target_status == SessionStatus::Snoozed {
-            SessionRepository::update_status(&mut *tx, active_id, target_status.clone(), None, now_ms).await?;
-            SessionRepository::increment_snooze(&mut *tx, active_id, now_ms).await?;
+            SessionRepository::update_status(
+                &mut *tx, session_id, target_status.clone(), None, now_ms
+            ).await?;
+            SessionRepository::increment_snooze(&mut *tx, session_id, now_ms).await?;
         } else {
-            SessionRepository::update_status(&mut *tx, active_id, target_status.clone(), Some(now_ms), now_ms).await?;
+            SessionRepository::update_status(
+                &mut *tx, session_id, target_status.clone(), Some(now_ms), now_ms
+            ).await?;
         }
 
-        // 4. Statistics
-        if target_status == SessionStatus::Completed
-            || target_status == SessionStatus::TimedOut
-            || target_status == SessionStatus::Ignored
-        {
+        if let Some(settings) = settings {
             let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            // Fetch settings to get interval minutes
-            let settings = crate::services::SettingsService::load_all(pool).await.unwrap_or_default();
-            
             StatisticsService::recompute_for_date(
                 &mut *tx,
                 &today_str,
                 active_ms_today,
                 settings.reminder_interval_minutes,
-            )
-            .await?;
+            ).await?;
         }
 
-        // 5. Commit
         tx.commit().await?;
-        log::info!("ReminderEngine: Session {} transaction committed with status '{}'.", active_id, target_status);
+        log::info!(
+            "ReminderEngine: Session {} committed with status '{}'.",
+            session_id, target_status
+        );
 
-        // 6. Scheduler Handoff
-        scheduler.report_resolution(&target_status, snooze_delay_minutes, pool).await;
-
-        // 7. Presentation & Business Notifications
-        self.emit_outcome_events(active_id, &target_status, snooze_delay_minutes);
-
-        // 8. Completed: Update internal engine state
-        let next_engine_state = if target_status == SessionStatus::Snoozed {
-            EngineState::Snoozed
-        } else {
-            EngineState::Idle
-        };
-
+        // Publish the committed state before scheduler handoff so an immediate due
+        // callback cannot observe Resolving and create a duplicate session.
         {
-            let mut guard = match self.inner.lock() {
-                Ok(g) => g,
-                Err(e) => return Err(crate::errors::AppError::Internal(e.to_string())),
-            };
-            guard.engine_state = next_engine_state;
-            if target_status != SessionStatus::Snoozed {
+            let mut guard = self.inner.lock().map_err(|e| {
+                crate::errors::AppError::Internal(e.to_string())
+            })?;
+            if guard.active_session_id != Some(session_id)
+                || guard.engine_state != EngineState::Resolving
+            {
+                return Err(crate::errors::AppError::Internal(
+                    "Reminder Engine state changed during committed resolution".into()
+                ));
+            }
+            if target_status == SessionStatus::Snoozed {
+                guard.engine_state = EngineState::Snoozed;
+            } else {
+                guard.engine_state = EngineState::Idle;
                 guard.active_session_id = None;
             }
         }
 
+        scheduler.report_resolution(&target_status, snooze_delay_minutes, pool).await;
+        self.emit_outcome_events(session_id, &target_status, snooze_delay_minutes);
         Ok(())
+    }
+
+    /// Restores a recoverable engine state and timeout protection after persistence failure.
+    fn restore_after_resolution_failure(
+        &self,
+        pool: Pool<Sqlite>,
+        session_id: i64,
+        previous_state: EngineState,
+        scheduler: SchedulerService,
+    ) {
+        let should_restore_timeout = {
+            let mut guard = match self.inner.lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::error!("ReminderEngine: failed to recover resolution state: {}", error);
+                    return;
+                }
+            };
+
+            if guard.active_session_id != Some(session_id)
+                || guard.engine_state != EngineState::Resolving
+            {
+                return;
+            }
+
+            guard.engine_state = previous_state.clone();
+            previous_state == EngineState::SessionActive
+        };
+
+        if should_restore_timeout {
+            let timeout_handle = self.spawn_timeout_timer(
+                pool,
+                session_id,
+                DEFAULT_SESSION_TIMEOUT_MINUTES,
+                scheduler,
+            );
+            if let Ok(mut guard) = self.inner.lock() {
+                if guard.active_session_id == Some(session_id)
+                    && guard.engine_state == EngineState::SessionActive
+                {
+                    guard.cancel_timeout();
+                    guard.timeout_handle = Some(timeout_handle);
+                } else {
+                    timeout_handle.abort();
+                }
+            } else {
+                timeout_handle.abort();
+            }
+        }
     }
 
     /// Cancels the active session during application shutdown.
@@ -742,6 +866,16 @@ impl ReminderEngineService {
     }
 }
 
+/// Reject invalid snooze durations before any timer or session state is changed.
+fn validate_snooze_delay(delay_minutes: i64) -> AppResult<()> {
+    if delay_minutes <= 0 {
+        return Err(crate::errors::AppError::Validation(
+            "Snooze duration must be greater than zero minutes".into()
+        ));
+    }
+    Ok(())
+}
+
 impl Default for ReminderEngineService {
     fn default() -> Self { Self::new() }
 }
@@ -758,3 +892,17 @@ pub fn build_reminder_due_callback(
         engine.handle_reminder_due(pool.clone(), scheduler.clone());
     })
 }
+
+#[cfg(test)]
+mod phase_9a_tests {
+    use super::validate_snooze_delay;
+
+    #[test]
+    fn snooze_duration_must_be_positive() {
+        assert!(validate_snooze_delay(1).is_ok());
+        assert!(validate_snooze_delay(5).is_ok());
+        assert!(validate_snooze_delay(0).is_err());
+        assert!(validate_snooze_delay(-1).is_err());
+    }
+}
+
