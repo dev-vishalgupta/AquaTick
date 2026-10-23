@@ -868,9 +868,10 @@ impl ReminderEngineService {
 
 /// Reject invalid snooze durations before any timer or session state is changed.
 fn validate_snooze_delay(delay_minutes: i64) -> AppResult<()> {
-    if delay_minutes <= 0 {
+    // Keep backend input aligned with the approved SnoozeSelector options.
+    if !matches!(delay_minutes, 5 | 10 | 15 | 30) {
         return Err(crate::errors::AppError::Validation(
-            "Snooze duration must be greater than zero minutes".into()
+            "Snooze duration must be one of: 5, 10, 15, or 30 minutes".into()
         ));
     }
     Ok(())
@@ -898,11 +899,14 @@ mod phase_9a_tests {
     use super::validate_snooze_delay;
 
     #[test]
-    fn snooze_duration_must_be_positive() {
-        assert!(validate_snooze_delay(1).is_ok());
-        assert!(validate_snooze_delay(5).is_ok());
-        assert!(validate_snooze_delay(0).is_err());
-        assert!(validate_snooze_delay(-1).is_err());
+    fn snooze_duration_must_match_supported_options() {
+        for duration in [5, 10, 15, 30] {
+            assert!(validate_snooze_delay(duration).is_ok());
+        }
+
+        for duration in [-1, 0, 1, 4, 6, 60, i64::MAX] {
+            assert!(validate_snooze_delay(duration).is_err());
+        }
     }
 }
 
